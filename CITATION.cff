@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the accompanying software paper."
+title: "posterior-landscape: morphological feature finding in two-dimensional probability densities"
+type: software
+authors:
+  - family-names: Mancarella
+    given-names: Michele
+version: 0.8.6
+date-released: 2026-08-20
+license: MIT

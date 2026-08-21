@@ -1,0 +1,17 @@
+# macOS / Python-generated files
+.DS_Store
+__pycache__/
+*.py[cod]
+*.nbc
+*.nbi
+
+# Local environments and test artifacts
+.venv/
+.pytest_cache/
+.coverage
+
+# Analysis outputs and local input data
+output/
+*.h5
+*.hdf5
+*.npz
