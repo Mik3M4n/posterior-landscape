@@ -8,6 +8,24 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+def save_settings(settings: "Settings", destination: str | Path) -> None:
+    """Save the INI with explicit input semantics and correctly resolved paths."""
+
+    parser = ConfigParser(interpolation=None)
+    parser.read(settings.source, encoding="utf-8")
+    for section in ("input", "output"):
+        if not parser.has_section(section):
+            parser.add_section(section)
+    for name, value in vars(settings.input).items():
+        parser.set("input", name, str(value))
+    parser.set("input", "file", str(settings.input.file.resolve()))
+    parser.set("output", "directory", str(settings.output.directory.resolve()))
+    path = Path(destination)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        parser.write(handle)
+
+
 def _boolean(parser: ConfigParser, section: str, option: str, default: bool) -> bool:
     if not parser.has_option(section, option):
         return default
@@ -58,6 +76,8 @@ class InputSettings:
     coordinate2_label: str = r"$m_2$"
     coordinate1_unit: str = ""
     coordinate2_unit: str = ""
+    grid_location: str = "nodes"
+    grid_measure: str = "linear"
 
 
 @dataclass(frozen=True)
@@ -182,6 +202,12 @@ def load_settings(path: str | Path) -> Settings:
     input_density_measure = text("input", "density_measure", "log").lower()
     if input_density_measure not in {"linear", "log"}:
         raise ValueError("input.density_measure must be 'linear' or 'log'.")
+    grid_location = text("input", "grid_location", "nodes").lower()
+    if grid_location not in {"nodes", "cell_centres"}:
+        raise ValueError("input.grid_location must be 'nodes' or 'cell_centres'.")
+    grid_measure = text("input", "grid_measure", "linear").lower()
+    if grid_measure not in {"linear", "log"}:
+        raise ValueError("input.grid_measure must be 'linear' or 'log'.")
 
     geometry = parser.get("analysis", "geometry", fallback="log").strip().lower()
     if geometry not in {"log", "linear"}:
@@ -363,6 +389,8 @@ def load_settings(path: str | Path) -> Settings:
             weights_dataset=text("input", "weights_dataset", "weights"),
             domain=domain,
             density_measure=input_density_measure,
+            grid_location=grid_location,
+            grid_measure=grid_measure,
             coordinate1_name=text("input", "coordinate1_name", "m1"),
             coordinate2_name=text("input", "coordinate2_name", "m2"),
             coordinate1_label=text("input", "coordinate1_label", r"$m_1$"),

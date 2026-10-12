@@ -15,7 +15,7 @@ import shutil
 import time
 from collections.abc import Iterable
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -34,7 +34,7 @@ from .association import (
     location_configuration_masks,
     pairwise_indicator_associations,
 )
-from .config import AnalysisSettings, Settings, load_settings
+from .config import AnalysisSettings, Settings, load_settings, save_settings
 from .ensemble import (
     BranchTracker,
     EnsembleSummary,
@@ -58,7 +58,6 @@ from .io import (
     density_in_feature_measure,
     h5py,
     open_density_store,
-    quadrature_weights,
     validate_store,
     write_json,
 )
@@ -159,6 +158,11 @@ def _fingerprint(settings: Settings, input_shape: tuple[int, ...]) -> str:
     digest.update(str(stat.st_size).encode())
     digest.update(str(stat.st_mtime_ns).encode())
     digest.update(__version__.encode())
+    # Resolved input semantics also protect programmatic settings replacements.
+    digest.update(json.dumps(asdict(settings.input), sort_keys=True, default=str).encode())
+    digest.update(b"spatial-quadrature-schema-1.0")
+    if settings.input.grid_location == "cell_centres":
+        digest.update(b"full-cell-overlap-tail-events-v1")
     return digest.hexdigest()
 
 
@@ -1779,6 +1783,18 @@ def _write_pairwise_feature_associations(
     return text_path, csv_path
 
 
+def _finite_tail_event_metadata() -> dict[str, str]:
+    return {
+        "tail_event_convention": "full_cell_overlap",
+        "P_any": "P(coordinate1 > threshold or coordinate2 > threshold)",
+        "P_both": "P(coordinate1 > threshold and coordinate2 > threshold)",
+        "P_straddle": "P(exactly one coordinate > threshold)",
+        "composition_condition": "coordinate1 > its draw-specific percentile",
+        "composition_both": "P(both coordinates exceed the coordinate1 threshold | coordinate1 exceeds)",
+        "composition_straddle": "P(coordinate2 <= coordinate1 threshold | coordinate1 exceeds)",
+    }
+
+
 def _write_global_tail_products(
     directory: Path,
     summary: EnsembleSummary,
@@ -1790,6 +1806,7 @@ def _write_global_tail_products(
 ) -> list[Path]:
     """Write the global any/both/straddling tail scales and curves."""
 
+    finite_cells = getattr(summary, "tail_event_convention", "ordered_marginal") == "full_cell_overlap"
     probabilities = summary.probabilities
     m1_interval = weighted_quantile(summary.tail_m1_scale, probabilities, weights)
     m2_interval = weighted_quantile(summary.tail_m2_scale, probabilities, weights)
@@ -1815,6 +1832,8 @@ def _write_global_tail_products(
             np.sum(weights[np.asarray(summary.tail_m2_boundary_limited, dtype=bool)])
         ),
     }
+    if finite_cells:
+        record.update(_finite_tail_event_metadata())
     for name, values in (
         ("m1_scale", m1_interval),
         ("m2_scale", m2_interval),
@@ -1889,6 +1908,9 @@ def _write_global_tail_products(
         "m1_boundary_limited": summary.tail_m1_boundary_limited,
         "m2_boundary_limited": summary.tail_m2_boundary_limited,
     }
+    if finite_cells:
+        payload["tail_event_convention"] = "full_cell_overlap"
+        payload["tail_event_definitions"] = json.dumps(_finite_tail_event_metadata(), sort_keys=True)
     if h0 is not None:
         payload["h0"] = np.asarray(h0, dtype=float)
     if chain_id is not None:
@@ -1920,6 +1942,15 @@ def _write_global_tail_products(
         "P_straddle(M)=P_any(M)-P_both(M).",
         "These are global tail scales, not local topological features or hard maxima.",
     ]
+    if finite_cells:
+        lines[0] = f"Global finite-cell component tail scales ({label} quantile)"
+        lines[-3:-1] = [
+            "P_any(M)=P(m1>M or m2>M); P_both(M)=P(m1>M and m2>M).",
+            "P_straddle(M)=P(exactly one coordinate exceeds M).",
+            "The composition at the m1 scale is conditional on m1 exceeding its threshold: ",
+            "both=P(m2>M | m1>M); straddling=P(m2<=M | m1>M).",
+            "Every active finite cell contributes its full nominal probability; diagonal bins are not clipped.",
+        ]
     if h0_record is not None:
         lines.extend(
             [
@@ -1974,6 +2005,7 @@ def _load_global_tail_summary(path: Path) -> Any | None:
             tail_m1_boundary_limited=np.asarray(tail["m1_boundary_limited"]),
             tail_m2_boundary_limited=np.asarray(tail["m2_boundary_limited"]),
             tail_probability=float(tail.attrs["probability"]),
+            tail_event_convention=_hdf5_text(tail.attrs.get("event_convention", "ordered_marginal")),
         )
 
 
@@ -2385,6 +2417,28 @@ def _store_location_configuration(
     )
 
 
+def _quadrature_output_arrays(grid: Grid) -> dict[str, np.ndarray]:
+    """Spatial weights and native-derived edges exposed in numerical products."""
+
+    values = {
+        "quadrature_m1": grid.weight1,
+        "quadrature_m2": grid.weight2,
+        "input_quadrature_m1": grid.input_weight1,
+        "input_quadrature_m2": grid.input_weight2,
+        "linear_quadrature_m1": grid.linear_weight1,
+        "linear_quadrature_m2": grid.linear_weight2,
+    }
+    if grid.grid_location == "cell_centres":
+        for suffix, axis in (("m1", grid.axis1), ("m2", grid.axis2)):
+            values[f"native_edges_{suffix}"] = axis.edges(
+                grid.grid_measure, log_base=grid.log_base
+            )
+            values[f"linear_edges_{suffix}"] = axis.edges("linear")
+            if np.all(axis.edges("linear") > 0.0):
+                values[f"log_edges_{suffix}"] = axis.edges("log", log_base=grid.log_base)
+    return values
+
+
 def _write_numerical_results(
     directory: Path,
     *,
@@ -2493,6 +2547,19 @@ def _write_numerical_results(
             feature_measure=grid.feature_measure,
             topology_sample_signature=topology_sample_signature,
         )
+        payload.update(_quadrature_output_arrays(grid))
+        payload["grid_location"] = grid.grid_location
+        payload["grid_measure"] = grid.grid_measure
+        payload["quadrature_schema_version"] = "1.0"
+        payload["quadrature_metadata"] = json.dumps(grid.quadrature_metadata, sort_keys=True)
+        payload["quadrature_signature"] = grid.quadrature_signature
+        if summary.tail_event_convention == "full_cell_overlap":
+            payload["tail_event_convention"] = summary.tail_event_convention
+        payload["maximum_input_normalization_error"] = summary.maximum_normalization_error
+        payload["maximum_conversion_normalization_error"] = summary.maximum_conversion_normalization_error
+        payload["reference_post_normalization_error"] = summary.reference_post_normalization_error
+        payload["maximum_post_normalization_error"] = summary.maximum_post_normalization_error
+        payload["maximum_marginal_normalization_error"] = summary.maximum_marginal_normalization_error
         if h0 is not None:
             payload["external_parameter"] = h0
             payload["h0"] = h0
@@ -2513,6 +2580,16 @@ def _write_numerical_results(
             grid.feature_measure
         )
         output.attrs["feature_measure"] = grid.feature_measure
+        output.attrs["grid_location"] = grid.grid_location
+        output.attrs["grid_measure"] = grid.grid_measure
+        output.attrs["quadrature_schema_version"] = "1.0"
+        output.attrs["quadrature_metadata"] = json.dumps(grid.quadrature_metadata, sort_keys=True)
+        output.attrs["quadrature_signature"] = grid.quadrature_signature
+        output.attrs["maximum_input_normalization_error"] = summary.maximum_normalization_error
+        output.attrs["maximum_post_normalization_error"] = summary.maximum_post_normalization_error
+        output.attrs["maximum_marginal_normalization_error"] = summary.maximum_marginal_normalization_error
+        output.attrs["maximum_conversion_normalization_error"] = summary.maximum_conversion_normalization_error
+        output.attrs["reference_post_normalization_error"] = summary.reference_post_normalization_error
         output.attrs["log_base"] = grid.log_base
         output.attrs["analysis_geometry"] = grid.geometry
         output.attrs["credible_mass"] = credible_mass
@@ -2579,9 +2656,9 @@ def _write_numerical_results(
             ("log_m1", grid.ell1),
             ("log_m2", grid.ell2),
             ("mask", grid.mask),
-            ("quadrature_m1", grid.weight1),
-            ("quadrature_m2", grid.weight2),
         ):
+            _dataset(coordinates, name, values)
+        for name, values in _quadrature_output_arrays(grid).items():
             _dataset(coordinates, name, values)
         posterior = output.create_group("posterior")
         for name, values in (
@@ -2601,10 +2678,18 @@ def _write_numerical_results(
             tail = output.create_group("global_tail")
             tail.attrs["type"] = "global_tail_scale"
             tail.attrs["probability"] = summary.tail_probability
+            tail.attrs["event_convention"] = summary.tail_event_convention
             tail.attrs["definitions"] = (
-                "P_any=P(m1>M); P_both=P(m2>M); "
-                "P_straddle=P_any-P_both"
+                "P_any=P(m1>M or m2>M); P_both=P(m1>M and m2>M); "
+                "P_straddle=P(exactly one coordinate exceeds M)"
+                if summary.tail_event_convention == "full_cell_overlap"
+                else "P_any=P(m1>M); P_both=P(m2>M); P_straddle=P_any-P_both"
             )
+            if summary.tail_event_convention == "full_cell_overlap":
+                tail.attrs["composition_at_m1_definition"] = (
+                    "conditional on m1>M1: both=P(m2>M1|m1>M1); "
+                    "straddle=P(m2<=M1|m1>M1)"
+                )
             for name, values in (
                 ("mass_grid", summary.tail_mass_grid),
                 ("P_any_quantiles", summary.tail_any_quantiles),
@@ -2988,7 +3073,16 @@ def _sample_draw_indices(number_draws: int, sample_draws: int = 16) -> np.ndarra
 def _topology_sample_signature(store: Any, grid: Grid) -> str:
     """Hash topology inputs at deterministic representative posterior draws."""
 
-    digest = hashlib.sha256(b"posterior-landscape-topology-sample-v1")
+    digest = hashlib.sha256(b"posterior-landscape-topology-sample-v2")
+    digest.update(grid.quadrature_signature.encode("ascii"))
+    if grid.grid_location == "cell_centres":
+        digest.update(b"full-cell-overlap-tail-events-v1")
+    digest.update(json.dumps({
+        "input_density_measure": grid.input_density_measure,
+        "feature_measure": grid.feature_measure,
+        "grid_location": grid.grid_location,
+        "grid_measure": grid.grid_measure,
+    }, sort_keys=True).encode("ascii"))
 
     def update(values: np.ndarray, dtype: Any) -> None:
         array = np.ascontiguousarray(np.asarray(values, dtype=dtype))
@@ -3031,6 +3125,16 @@ def _completed_topology_compatibility(
         previous_settings = load_settings(settings_copy)
     except (OSError, ValueError):
         return False, "", "the completed INI settings cannot be read"
+    if asdict(previous_settings.input) != asdict(settings.input):
+        return False, "", "the input interpretation or grid quadrature convention changed"
+    saved_location = manifest.get("grid_location", "nodes")
+    saved_measure = manifest.get("grid_measure", "linear")
+    if saved_location != grid.grid_location or saved_measure != grid.grid_measure:
+        return False, "", "the spatial quadrature convention changed"
+    if grid.grid_location == "cell_centres" and manifest.get(
+        "quadrature_signature"
+    ) != grid.quadrature_signature:
+        return False, "", "the finite-cell quadrature signature changed or is missing"
     previous_analysis = dict(vars(previous_settings.analysis))
     current_analysis = dict(vars(settings.analysis))
     previous_analysis.pop("run", None)
@@ -3064,6 +3168,20 @@ def _completed_topology_compatibility(
                 "",
                 "results.h5 predates saved m2 projections and global-tail arrays",
             )
+        if _hdf5_text(output.attrs.get("grid_location", "nodes")) != grid.grid_location:
+            return False, "", "results.h5 grid placement changed"
+        if _hdf5_text(output.attrs.get("grid_measure", "linear")) != grid.grid_measure:
+            return False, "", "results.h5 native grid measure changed"
+        saved_quadrature_signature = output.attrs.get("quadrature_signature", "")
+        if saved_quadrature_signature and _hdf5_text(saved_quadrature_signature) != grid.quadrature_signature:
+            return False, "", "results.h5 spatial weights or edges changed"
+        if grid.grid_location == "cell_centres" and not saved_quadrature_signature:
+            return False, "", "results.h5 lacks finite-cell quadrature metadata"
+        if grid.grid_location == "cell_centres" and settings.analysis.ordered_tails:
+            if "global_tail" not in output or _hdf5_text(output["global_tail"].attrs.get(
+                "event_convention", ""
+            )) != "full_cell_overlap":
+                return False, "", "the finite-cell joint tail event convention changed or is missing"
         expected_attributes = {
             "feature_measure": grid.feature_measure,
             "analysis_geometry": grid.geometry,
@@ -3087,6 +3205,13 @@ def _completed_topology_compatibility(
                 np.asarray(coordinates[name]), current
             ):
                 return False, "", f"the saved {name} grid changed"
+        for name, current in _quadrature_output_arrays(grid).items():
+            if name not in coordinates:
+                if grid.grid_location == "cell_centres":
+                    return False, "", f"the saved finite-cell array '{name}' is unavailable"
+                continue
+            if not np.array_equal(np.asarray(coordinates[name]), current):
+                return False, "", f"the saved quadrature array '{name}' changed"
         posterior = output["posterior"]
         if "weights" not in posterior or not np.allclose(
             np.asarray(posterior["weights"]),
@@ -3113,12 +3238,7 @@ def _completed_topology_compatibility(
         # Early archives did not store the representative density signature.
         # Their saved per-draw integrals provide a conservative compatibility
         # check; current outputs use the stronger signature above.
-        input_cell_weights = (
-            np.multiply.outer(
-                quadrature_weights(grid.ell1), quadrature_weights(grid.ell2)
-            )
-            * grid.mask
-        )
+        input_cell_weights = grid.input_cell_weights
         indices = _sample_draw_indices(store.number_draws)
         current_normalization = np.asarray(
             [
@@ -3649,7 +3769,7 @@ def _run_two_dimensional(settings: Settings) -> Path:
         topology_sample_signature = _topology_sample_signature(store, grid)
         settings_copy = directory / "settings.ini"
         if settings_copy.resolve() != settings.source.resolve():
-            shutil.copy2(settings.source, settings_copy)
+            save_settings(settings, settings_copy)
 
         workers = min(_automatic_workers(settings.compute.workers), store.number_draws)
         batch_size = _automatic_batch_size(settings.compute.batch_size, grid, workers)
@@ -3666,6 +3786,15 @@ def _run_two_dimensional(settings: Settings) -> Path:
             grid.input_density_measure,
             grid.feature_measure,
             grid.geometry,
+        )
+        logger.info("Input grid placement: %s", grid.grid_location.replace("_", " "))
+        logger.info("Native cell coordinate: %s", grid.grid_measure)
+        logger.info("Quadrature: %s", grid.quadrature_metadata["quadrature_method"])
+        logger.info(
+            "Active mask cells: %d; active ordered diagonal cells: %d; diagonal cells: %s",
+            grid.quadrature_metadata["active_mask_cells"],
+            grid.quadrature_metadata["active_diagonal_cells"],
+            "full weight" if grid.grid_location == "cell_centres" else "nodal convention",
         )
         if settings.analysis.detect_shoulders:
             logger.info(
@@ -3722,6 +3851,14 @@ def _run_two_dimensional(settings: Settings) -> Path:
             batch_size=batch_size,
         )
 
+        logger.info(
+            "Maximum raw input-normalization error: %.12g; post-normalization error: %.12g; "
+            "marginal-normalization error: %.12g; conversion-normalization error: %.12g.",
+            summary.maximum_normalization_error,
+            summary.maximum_post_normalization_error,
+            summary.maximum_marginal_normalization_error,
+            summary.maximum_conversion_normalization_error,
+        )
         logger.info("Extracting the fixed catalogue from the posterior-median field.")
         reference_analyses = [
             analyze_field(
@@ -4264,6 +4401,7 @@ def _run_two_dimensional(settings: Settings) -> Path:
                     "P_any": "P(coordinate1 > threshold)",
                     "P_both": "P(coordinate2 > threshold)",
                     "P_straddle": "P(coordinate1 > threshold, coordinate2 <= threshold)",
+                    **(_finite_tail_event_metadata() if summary.tail_event_convention == "full_cell_overlap" else {}),
                 }
                 if settings.analysis.ordered_tails
                 else {"enabled": False}
@@ -4285,7 +4423,18 @@ def _run_two_dimensional(settings: Settings) -> Path:
             "location_configurations": _location_configuration_manifest(
                 location_configurations
             ),
+            "grid_location": grid.grid_location,
+            "grid_measure": grid.grid_measure,
+            "quadrature_schema_version": "1.0",
+            "quadrature": grid.quadrature_metadata,
+            "quadrature_signature": grid.quadrature_signature,
+            "active_mask_cells": grid.quadrature_metadata["active_mask_cells"],
+            "active_diagonal_cells": grid.quadrature_metadata["active_diagonal_cells"],
             "maximum_input_normalization_error": summary.maximum_normalization_error,
+            "maximum_post_normalization_error": summary.maximum_post_normalization_error,
+            "maximum_marginal_normalization_error": summary.maximum_marginal_normalization_error,
+            "maximum_conversion_normalization_error": summary.maximum_conversion_normalization_error,
+            "reference_post_normalization_error": summary.reference_post_normalization_error,
             "features": {
                 "peaks": sum(item.template.kind == "peak" for item in points),
                 "pits": sum(item.template.kind == "pit" for item in points),

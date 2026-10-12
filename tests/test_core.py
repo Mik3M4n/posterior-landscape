@@ -333,7 +333,7 @@ class CoreTests(unittest.TestCase):
         )
         outside = supplied.copy()
         outside[0, 1] = True
-        with self.assertRaisesRegex(ValueError, "coordinate2 < coordinate1"):
+        with self.assertRaisesRegex(ValueError, "coordinate2 <= coordinate1"):
             _domain_mask(first, second, outside, "ordered")
 
     def test_directional_power_law_has_no_shoulder(self) -> None:

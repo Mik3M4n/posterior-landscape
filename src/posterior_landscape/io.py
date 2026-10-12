@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from collections.abc import Iterator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from typing import Any
 import numpy as np
 
 from .config import AssociationSettings, InputSettings
+from .quadrature import AxisQuadrature, SpatialQuadrature, build_axis_quadrature, nodal_weights
 
 try:  # Imported lazily enough that NPZ-only utilities remain usable.
     import h5py  # type: ignore
@@ -27,18 +29,25 @@ def logarithm(values: np.ndarray, base: float) -> np.ndarray:
 def quadrature_weights(coordinates: np.ndarray) -> np.ndarray:
     """Trapezoidal nodal weights for a strictly increasing 1D grid."""
 
-    coordinates = np.asarray(coordinates, dtype=float)
-    if coordinates.ndim != 1 or coordinates.size < 2:
-        raise ValueError("Each coordinate grid must be one-dimensional with >=2 nodes.")
-    differences = np.diff(coordinates)
-    if np.any(~np.isfinite(coordinates)) or np.any(differences <= 0.0):
-        raise ValueError("Coordinate grids must be finite and strictly increasing.")
-    result = np.empty_like(coordinates)
-    result[0] = 0.5 * differences[0]
-    result[-1] = 0.5 * differences[-1]
-    if coordinates.size > 2:
-        result[1:-1] = 0.5 * (coordinates[2:] - coordinates[:-2])
-    return result
+    return nodal_weights(coordinates)
+
+
+def ordered_boundary_tolerance(first: np.ndarray, second: np.ndarray) -> np.ndarray:
+    """Only tolerate floating-point roundoff at a physically ordered boundary."""
+
+    return 8.0 * np.finfo(float).eps * np.maximum(np.abs(first), np.abs(second))
+
+
+def ordered_cells(first: np.ndarray, second: np.ndarray) -> np.ndarray:
+    first = np.asarray(first, dtype=float)[:, None]
+    second = np.asarray(second, dtype=float)[None, :]
+    return second <= first + ordered_boundary_tolerance(first, second)
+
+
+def diagonal_cells(first: np.ndarray, second: np.ndarray) -> np.ndarray:
+    first = np.asarray(first, dtype=float)[:, None]
+    second = np.asarray(second, dtype=float)[None, :]
+    return np.abs(first - second) <= ordered_boundary_tolerance(first, second)
 
 
 @dataclass(frozen=True)
@@ -66,6 +75,10 @@ class Grid:
     coordinate2_unit: str = ""
     input_weight1: np.ndarray | None = None
     input_weight2: np.ndarray | None = None
+    grid_location: str = "nodes"
+    grid_measure: str = "linear"
+    axis1: AxisQuadrature | None = None
+    axis2: AxisQuadrature | None = None
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -74,6 +87,63 @@ class Grid:
     @property
     def cell_weights(self) -> np.ndarray:
         return np.multiply.outer(self.weight1, self.weight2) * self.mask
+
+    @property
+    def input_cell_weights(self) -> np.ndarray:
+        # The public legacy Grid constructor allowed absent input weights.
+        # Preserve the old logarithmic fallback for that nodal-only API path;
+        # validated input grids always carry their explicit input weights.
+        first = self.input_weight1 if self.input_weight1 is not None else (
+            quadrature_weights(self.ell1) if self.grid_location == "nodes"
+            else self.quadrature.axis1.weights(self.input_density_measure)
+        )
+        second = self.input_weight2 if self.input_weight2 is not None else (
+            quadrature_weights(self.ell2) if self.grid_location == "nodes"
+            else self.quadrature.axis2.weights(self.input_density_measure)
+        )
+        return np.multiply.outer(first, second) * self.mask
+
+    @property
+    def quadrature(self) -> SpatialQuadrature:
+        first = self.axis1 or build_axis_quadrature(
+            self.m1, self.grid_location, self.grid_measure, self.log_base
+        )
+        second = self.axis2 or build_axis_quadrature(
+            self.m2, self.grid_location, self.grid_measure, self.log_base
+        )
+        return SpatialQuadrature(first, second, self.mask)
+
+    @property
+    def linear_weight1(self) -> np.ndarray:
+        return self.quadrature.axis1.weights("linear")
+
+    @property
+    def linear_weight2(self) -> np.ndarray:
+        return self.quadrature.axis2.weights("linear")
+
+    @property
+    def quadrature_signature(self) -> str:
+        digest = hashlib.sha256(self.quadrature.signature().encode("ascii"))
+        digest.update(self.input_density_measure.encode("ascii"))
+        digest.update(self.feature_measure.encode("ascii"))
+        for weights in (self.weight1, self.weight2, self.input_cell_weights):
+            digest.update(np.ascontiguousarray(weights, dtype="<f8").tobytes())
+        return digest.hexdigest()
+
+    @property
+    def quadrature_metadata(self) -> dict[str, Any]:
+        metadata = self.quadrature.axis1.metadata()
+        metadata.update(
+            active_mask_cells=int(np.count_nonzero(self.mask)),
+            active_diagonal_cells=int(np.count_nonzero(
+                self.mask & diagonal_cells(self.m1, self.m2)
+            )) if self.ordered_domain else 0,
+            ordered_diagonal_cells=(
+                "full_weight" if self.grid_location == "cell_centres"
+                else "nodal_quadrature"
+            ),
+        )
+        return metadata
 
     @property
     def typical_spacing(self) -> float:
@@ -145,7 +215,7 @@ def _domain_mask(
             )
         return np.ones((first.size, second.size), dtype=bool)
     if domain == "ordered":
-        expected = second[None, :] <= first[:, None]
+        expected = ordered_cells(first, second)
         if supplied is not None:
             if np.any(supplied & ~expected):
                 raise ValueError(
@@ -358,6 +428,7 @@ def validate_store(
         geometry == "log"
         or feature_measure == "log"
         or input_density_measure == "log"
+        or (input_settings.grid_location == "cell_centres" and input_settings.grid_measure == "log")
     )
     if logarithmic_coordinates_needed and (
         np.any(store.m1 <= 0.0) or np.any(store.m2 <= 0.0)
@@ -431,20 +502,22 @@ def validate_store(
     )
     measure1 = ell1 if feature_measure == "log" else store.m1
     measure2 = ell2 if feature_measure == "log" else store.m2
-    weight1 = quadrature_weights(measure1)
-    weight2 = quadrature_weights(measure2)
+    axis1 = build_axis_quadrature(
+        store.m1, input_settings.grid_location, input_settings.grid_measure, log_base
+    )
+    axis2 = build_axis_quadrature(
+        store.m2, input_settings.grid_location, input_settings.grid_measure, log_base
+    )
+    weight1 = axis1.weights(feature_measure)
+    weight2 = axis2.weights(feature_measure)
     geometry1 = ell1 if geometry == "log" else store.m1.copy()
     geometry2 = ell2 if geometry == "log" else store.m2.copy()
     quadrature_weights(geometry1)
     quadrature_weights(geometry2)
-    input_weight1 = quadrature_weights(
-        ell1 if input_density_measure == "log" else store.m1
-    )
-    input_weight2 = quadrature_weights(
-        ell2 if input_density_measure == "log" else store.m2
-    )
+    input_weight1 = axis1.weights(input_density_measure)
+    input_weight2 = axis2.weights(input_density_measure)
     ordered_domain = bool(
-        np.all(~store.mask | (store.m2[None, :] <= store.m1[:, None]))
+        np.all(~store.mask | ordered_cells(store.m1, store.m2))
     )
 
     grid = Grid(
@@ -471,6 +544,10 @@ def validate_store(
         coordinate2_unit=input_settings.coordinate2_unit,
         input_weight1=input_weight1,
         input_weight2=input_weight2,
+        grid_location=input_settings.grid_location,
+        grid_measure=input_settings.grid_measure,
+        axis1=axis1,
+        axis2=axis2,
     )
 
     indices = np.unique(
@@ -494,6 +571,8 @@ def log_to_feature_jacobian(grid: Grid) -> np.ndarray:
 
     if grid.feature_measure == "log":
         return np.ones(grid.shape, dtype=float)
+    if grid.grid_location == "cell_centres":
+        return 1.0 / grid.quadrature.conversion_factor("log", grid.feature_measure)
     return (
         np.multiply.outer(grid.m1, grid.m2)
         * float(np.log(grid.log_base) ** 2)
@@ -505,6 +584,10 @@ def input_to_feature_factor(grid: Grid) -> np.ndarray:
 
     if grid.input_density_measure == grid.feature_measure:
         return np.ones(grid.shape, dtype=float)
+    if grid.grid_location == "cell_centres":
+        return grid.quadrature.conversion_factor(
+            grid.input_density_measure, grid.feature_measure
+        )
     jacobian = (
         np.multiply.outer(grid.m1, grid.m2)
         * float(np.log(grid.log_base) ** 2)

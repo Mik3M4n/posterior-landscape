@@ -1,6 +1,6 @@
 """Public interface for posterior-landscape."""
 
-__version__ = "0.8.6"
+__version__ = "0.8.7"
 
 from .config import Settings, load_settings
 from .io import write_hdf5

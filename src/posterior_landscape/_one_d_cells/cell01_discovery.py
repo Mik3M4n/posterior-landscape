@@ -167,95 +167,126 @@ if not np.allclose(
         "This diagnostic assumes a geometrically spaced m_grid."
     )
 
-# Midpoint cells locate partial-band overlaps. Their widths need not equal
-# the notebook's quadrature weights `dm` (for example, `dm` may use
-# trapezoidal endpoint weights).
-linear_mass_cell_edges = np.empty(m_grid.size + 1, dtype=float)
-linear_mass_cell_edges[1:-1] = 0.5 * (m_grid[:-1] + m_grid[1:])
-linear_mass_cell_edges[0] = m_grid[0] - 0.5 * (m_grid[1] - m_grid[0])
-linear_mass_cell_edges[-1] = m_grid[-1] + 0.5 * (
-    m_grid[-1] - m_grid[-2]
-)
-linear_mass_cell_widths = np.diff(linear_mass_cell_edges)
-
-linear_mass_quadrature_weights = np.asarray(
-    dm,
-    dtype=float,
-).reshape(-1)
-
-if linear_mass_quadrature_weights.size != m_grid.size:
-    raise RuntimeError(
-        "dm must contain one linear-mass quadrature weight per m_grid point."
+if "CELL_QUADRATURE_AXIS" in globals():
+    # Explicit finite-volume inputs are already marginalized in the selected
+    # measure.  Both measures refer to these same native physical bins.
+    linear_mass_cell_edges = CELL_QUADRATURE_AXIS.edges("linear")
+    log_mass_cell_edges = CELL_QUADRATURE_AXIS.edges("log", log_base=np.e)
+    linear_mass_cell_widths = np.diff(linear_mass_cell_edges)
+    log_mass_cell_widths = np.diff(log_mass_cell_edges)
+    linear_mass_quadrature_weights = CELL_QUADRATURE_AXIS.weights("linear")
+    log_mass_quadrature_weights = CELL_QUADRATURE_AXIS.weights("log", log_base=np.e)
+    MASS_MEASURE_CELL_EDGES = CELL_QUADRATURE_AXIS.edges(
+        MASS_DENSITY_MEASURE, log_base=np.e
     )
-
-if not np.all(
-    np.isfinite(linear_mass_quadrature_weights)
-    & (linear_mass_quadrature_weights >= 0.0)
-) or not np.any(linear_mass_quadrature_weights > 0.0):
-    raise RuntimeError(
-        "dm contains invalid linear-mass quadrature weights."
+    MASS_MEASURE_CELL_WIDTHS = np.diff(MASS_MEASURE_CELL_EDGES)
+    MASS_MEASURE_WIDTHS = CELL_QUADRATURE_AXIS.weights(
+        MASS_DENSITY_MEASURE, log_base=np.e
     )
-
-# Midpoint cells in logarithmic mass.
-log_mass_cell_edges = np.empty(m_grid.size + 1, dtype=float)
-log_mass_cell_edges[1:-1] = 0.5 * (
-    log_m_grid[:-1] + log_m_grid[1:]
-)
-log_mass_cell_edges[0] = log_m_grid[0] - 0.5 * (
-    log_m_grid[1] - log_m_grid[0]
-)
-log_mass_cell_edges[-1] = log_m_grid[-1] + 0.5 * (
-    log_m_grid[-1] - log_m_grid[-2]
-)
-log_mass_cell_widths = np.diff(log_mass_cell_edges)
-
-# Preserve the original discrete probability weights exactly under
-# q(ln m) = m p(m): [m p(m)] [dm / m] = p(m) dm.
-log_mass_quadrature_weights = (
-    linear_mass_quadrature_weights
-    / m_grid
-)
-
-pm1_linear_samples = np.where(
-    np.isfinite(pm1_linear_samples)
-    & (pm1_linear_samples >= 0.0),
-    pm1_linear_samples,
-    0.0,
-)
-
-linear_draw_norm = np.einsum(
-    "si,i->s",
-    pm1_linear_samples,
-    linear_mass_quadrature_weights,
-    optimize=True,
-)
-
-if not np.all(
-    np.isfinite(linear_draw_norm)
-    & (linear_draw_norm > 0.0)
-):
-    raise RuntimeError(
-        "pm1_samples contains draws with invalid linear-mass normalization."
+    pm1_feature_samples = np.where(
+        np.isfinite(pm1_linear_samples) & (pm1_linear_samples >= 0.0),
+        pm1_linear_samples,
+        0.0,
     )
-
-pm1_linear_samples = (
-    pm1_linear_samples
-    / linear_draw_norm[:, None]
-)
-
-if MASS_DENSITY_MEASURE == "linear":
-    MASS_MEASURE_CELL_EDGES = linear_mass_cell_edges
-    MASS_MEASURE_CELL_WIDTHS = linear_mass_cell_widths
-    MASS_MEASURE_WIDTHS = linear_mass_quadrature_weights
-    pm1_feature_samples = pm1_linear_samples.copy()
+    # Keep the legacy variable available in its stated measure, without
+    # applying a centre Jacobian to cell values.
+    pm1_linear_samples = pm1_feature_samples * CELL_QUADRATURE_AXIS.conversion_factor(
+        MASS_DENSITY_MEASURE, "linear", source_log_base=np.e
+    )[None, :]
+    linear_draw_norm = np.einsum(
+        "si,i->s", pm1_linear_samples, linear_mass_quadrature_weights,
+        optimize=True,
+    )
 else:
-    MASS_MEASURE_CELL_EDGES = log_mass_cell_edges
-    MASS_MEASURE_CELL_WIDTHS = log_mass_cell_widths
-    MASS_MEASURE_WIDTHS = log_mass_quadrature_weights
-    pm1_feature_samples = (
-        pm1_linear_samples
-        * m_grid[None, :]
+    # Midpoint cells locate partial-band overlaps. Their widths need not equal
+    # the notebook's quadrature weights `dm` (for example, `dm` may use
+    # trapezoidal endpoint weights).
+    linear_mass_cell_edges = np.empty(m_grid.size + 1, dtype=float)
+    linear_mass_cell_edges[1:-1] = 0.5 * (m_grid[:-1] + m_grid[1:])
+    linear_mass_cell_edges[0] = m_grid[0] - 0.5 * (m_grid[1] - m_grid[0])
+    linear_mass_cell_edges[-1] = m_grid[-1] + 0.5 * (
+        m_grid[-1] - m_grid[-2]
     )
+    linear_mass_cell_widths = np.diff(linear_mass_cell_edges)
+
+    linear_mass_quadrature_weights = np.asarray(
+        dm,
+        dtype=float,
+    ).reshape(-1)
+
+    if linear_mass_quadrature_weights.size != m_grid.size:
+        raise RuntimeError(
+            "dm must contain one linear-mass quadrature weight per m_grid point."
+        )
+
+    if not np.all(
+        np.isfinite(linear_mass_quadrature_weights)
+        & (linear_mass_quadrature_weights >= 0.0)
+    ) or not np.any(linear_mass_quadrature_weights > 0.0):
+        raise RuntimeError(
+            "dm contains invalid linear-mass quadrature weights."
+        )
+
+    # Midpoint cells in logarithmic mass.
+    log_mass_cell_edges = np.empty(m_grid.size + 1, dtype=float)
+    log_mass_cell_edges[1:-1] = 0.5 * (
+        log_m_grid[:-1] + log_m_grid[1:]
+    )
+    log_mass_cell_edges[0] = log_m_grid[0] - 0.5 * (
+        log_m_grid[1] - log_m_grid[0]
+    )
+    log_mass_cell_edges[-1] = log_m_grid[-1] + 0.5 * (
+        log_m_grid[-1] - log_m_grid[-2]
+    )
+    log_mass_cell_widths = np.diff(log_mass_cell_edges)
+
+    # Preserve the original discrete probability weights exactly under
+    # q(ln m) = m p(m): [m p(m)] [dm / m] = p(m) dm.
+    log_mass_quadrature_weights = (
+        linear_mass_quadrature_weights
+        / m_grid
+    )
+
+    pm1_linear_samples = np.where(
+        np.isfinite(pm1_linear_samples)
+        & (pm1_linear_samples >= 0.0),
+        pm1_linear_samples,
+        0.0,
+    )
+
+    linear_draw_norm = np.einsum(
+        "si,i->s",
+        pm1_linear_samples,
+        linear_mass_quadrature_weights,
+        optimize=True,
+    )
+
+    if not np.all(
+        np.isfinite(linear_draw_norm)
+        & (linear_draw_norm > 0.0)
+    ):
+        raise RuntimeError(
+            "pm1_samples contains draws with invalid linear-mass normalization."
+        )
+
+    pm1_linear_samples = (
+        pm1_linear_samples
+        / linear_draw_norm[:, None]
+    )
+
+    if MASS_DENSITY_MEASURE == "linear":
+        MASS_MEASURE_CELL_EDGES = linear_mass_cell_edges
+        MASS_MEASURE_CELL_WIDTHS = linear_mass_cell_widths
+        MASS_MEASURE_WIDTHS = linear_mass_quadrature_weights
+        pm1_feature_samples = pm1_linear_samples.copy()
+    else:
+        MASS_MEASURE_CELL_EDGES = log_mass_cell_edges
+        MASS_MEASURE_CELL_WIDTHS = log_mass_cell_widths
+        MASS_MEASURE_WIDTHS = log_mass_quadrature_weights
+        pm1_feature_samples = (
+            pm1_linear_samples
+            * m_grid[None, :]
+        )
 
 # Renormalize in the selected measure.  For a sufficiently fine grid this
 # correction is very close to unity, but making it explicit prevents a
@@ -524,6 +555,14 @@ def _posterior_mass_percentile(
     If lower_mass is supplied, compute the percentile of the
     conditional distribution p(m1 | m1 > lower_mass).
     """
+
+    if "CELL_QUADRATURE_AXIS" in globals():
+        # Finite-volume CDFs live at bin edges.  Inversion interpolates inside
+        # a bin in the selected measure, including fractional boundary bins.
+        return _cell_percentile(
+            density_samples, CELL_QUADRATURE_AXIS, MASS_DENSITY_MEASURE,
+            percentile, lower=lower_mass, log_base=np.e,
+        )
 
     integration_widths = np.asarray(
         MASS_MEASURE_WIDTHS,

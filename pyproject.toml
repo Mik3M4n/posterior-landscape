@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "posterior-landscape"
-version = "0.8.6"
+version = "0.8.7"
 description = "Morphological feature analysis for two-dimensional probability-density ensembles."
 readme = "README.md"
 requires-python = ">=3.11"

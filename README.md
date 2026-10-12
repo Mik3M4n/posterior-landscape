@@ -31,7 +31,9 @@ Start from one of the supplied files:
 
 - `settings.example.ini`: a generic full-square synthetic analysis;
 - `settings.gw.example.ini`: an explicit rendering of the ordered-mass
-  analysis.
+  nodal analysis;
+- `settings.pixelpop.example.ini`: the finite-cell PixelPop baseline, using
+  native logarithmic bins and a fresh output directory.
 
 All paths in an INI file are resolved relative to that file.
 
@@ -45,6 +47,8 @@ coordinate1_dataset = x1
 coordinate2_dataset = x2
 domain = full
 density_measure = linear
+grid_location = nodes
+grid_measure = linear
 coordinate1_name = x1
 coordinate2_name = x2
 coordinate1_label = $x_1$
@@ -110,19 +114,67 @@ non-negative; values outside the mask are ignored.
 - `log`: density per `dlog_base(x1) dlog_base(x2)`.
 
 `analysis.feature_measure` independently chooses the measure in which
-morphology and probability summaries are computed. The package applies the
-Jacobian internally and normalizes every draw in its declared input measure.
+morphology and probability summaries are computed. The package normalizes
+every draw in its declared input measure and converts to the feature measure
+using the grid-placement convention below.
 Log input, log geometry, log feature measures, 1D analysis, and directional
 shoulders require positive coordinates.
+
+### Grid placement and finite-volume cells
+
+`input.grid_location` is explicit and defaults to `nodes`:
+
+| Setting | Spatial integration | Density-measure conversion |
+|---|---|---|
+| `nodes` | Existing separable trapezoidal weights | Existing centre-evaluated Jacobian |
+| `cell_centres` | Full finite-volume widths from inferred cell edges | Conservative axis-width ratios |
+
+Omitting `grid_location` or setting it to `nodes` preserves the 0.8.6
+scientific numerical behavior, including the independent notebook-based 1D
+workflow, projections, moments, tails, and associations. New metadata and
+cache signatures may differ. `input.grid_measure` defaults to `linear` and
+has **no numerical effect in nodal mode**.
+
+For `cell_centres`, `grid_measure` states where the cells were constructed:
+`linear` means physical coordinates; `log` means logarithmic coordinates
+using `analysis.log_base`. In that native coordinate, interior edges are
+adjacent-centre midpoints and the two exterior edges extend by half the
+nearest centre spacing. Physical and logarithmic widths are transformations
+of these same edges. The package never infers a second set of bins by
+midpointing transformed centres.
+
+A finite-cell density in measure `a` converts to measure `b` as
+
+\[
+F^{(b)}_{ij}=F^{(a)}_{ij}
+\frac{\Delta\nu^{(a)}_{1,i}\Delta\nu^{(a)}_{2,j}}
+     {\Delta\nu^{(b)}_{1,i}\Delta\nu^{(b)}_{2,j}}.
+\]
+
+Thus each cell's probability mass and the total integral are conserved before
+the numerical-safety normalization. For natural-log native bins, the
+physical widths are `exp(log_edge_high) - exp(log_edge_low)`, and conversion
+to linear density uses `Delta ln(x) / Delta x`, rather than `1/x`.
+
+The Boolean mask denotes cells present in the input. Every active finite
+cell receives its full nominal area, including cells whose centres lie on
+an ordered-domain diagonal. There is no automatic half-weighting or
+geometric clipping. `weights_dataset` continues to identify posterior-draw
+weights, never spatial weights. Supplied fractional-cell areas and explicit
+edge datasets are outside this interface; current edges are inferred.
 
 The supported domains are:
 
 - `full`: the complete rectangular grid;
 - `mask`: exactly the supplied mask;
-- `ordered`: every valid cell must satisfy `coordinate2 < coordinate1`; an
-  optional supplied mask may further restrict that triangle;
+- `ordered`: every valid cell must satisfy `coordinate2 <= coordinate1`,
+  allowing only a small floating-point comparison tolerance; an optional
+  supplied mask may further restrict that inclusive triangle;
 - `legacy`: using `mask` when present and otherwise using
   `m2 < m1`.
+
+Explicit `ordered` mode retains diagonal cells. The historical strict
+missing-mask behavior of `legacy` is unchanged.
 
 The helper `posterior_landscape.write_hdf5(...)` writes the expected HDF5
 layout. Dataset names and density measure can be supplied explicitly.
@@ -138,12 +190,27 @@ regions. Its current smoothing and matching coordinates are logarithmic, so
 both coordinate grids must be positive. It also retains the requirement
 of equal-weight posterior draws.
 
+Only explicit `cell_centres` mode activates finite-cell marginalization,
+conservative resampling when needed, cell-edge cumulative probabilities,
+and interval probabilities built from the selected measure's cell widths.
+The existing nodal 1D numerical path remains unchanged.
+
 ### Ordered tails
 
 Set `analysis.ordered_tails = true` only for a domain entirely contained in
-`coordinate2 < coordinate1`. The package then computes the configured global
+`coordinate2 <= coordinate1`. The package then computes the configured global
 upper-tail scales and the ordered `P_any`, `P_both`, and `P_straddle`
 decomposition. This option is rejected on a full square or a non-ordered mask.
+
+In finite-cell mode, tail probabilities integrate overlaps of the same full
+nominal bins: `P_any` means either coordinate exceeds the threshold, `P_both`
+means both do, and `P_straddle` means exactly one does. They are computed
+from joint cell probabilities, rather than inferred from ordered marginal
+identities; diagonal bins are not clipped. The reported composition at the
+primary-mass tail scale remains conditional on `coordinate1` exceeding that
+scale, distinguishing both-coordinate exceedance from primary-only
+exceedance. That conditional composition is separate from the overall
+exactly-one-exceedance curve. The nodal tail calculation remains unchanged.
 
 ### Directional shoulders
 
@@ -185,6 +252,48 @@ files still parse, but PNG output is not produced.
 Runs are resumable. Use a new output directory when changing scientific
 settings; use `overwrite = true` only when replacing generated products is
 intended.
+
+The saved settings, log, manifest, and numerical output identify grid
+placement, native measure, quadrature construction, inferred edges and
+axis weights, active/diagonal cell counts, and normalization errors.
+Changing `grid_location` or `grid_measure` invalidates incompatible resume
+and cache products. Historical nodal products are never reused as finite-cell
+results.
+
+## PixelPop finite-cell baseline
+
+For the PixelPop reconstruction with density per
+`dln(m1) dln(m2)`, add these two lines to `[input]`:
+
+```ini
+grid_location = cell_centres
+grid_measure = log
+```
+
+Keep `domain = ordered`, `density_measure = log`, the original inclusive
+mask, and `analysis.log_base = e`. All 5050 active cells in the supplied
+100-by-100 ordered mask, including the 100 diagonal cells, remain active.
+Neither the input HDF5 nor its mask needs modification.
+
+Copy `settings.pixelpop.example.ini` and adjust paths if needed. First audit
+all draws, then run only the baseline:
+
+```bash
+posterior-landscape validate settings.pixelpop.example.ini --all-draws --json
+posterior-landscape run settings.pixelpop.example.ini
+```
+
+The read-only audit streams all 4000 draws and reports the actual raw-integral
+minimum, 5th percentile, median, 95th percentile, maximum, maximum absolute
+normalization error, active and diagonal counts, and marginal-normalization
+errors. It also reports errors after normalization. The expected improvement
+must be checked from these measured values, not assumed from a target value.
+
+Run into a fresh output directory with `persistence_threshold = auto` and
+inspect the newly selected baseline threshold `T0`. Only then construct
+fixed-threshold variants at `0.5 T0` and `2 T0`. The old `T0 = 0.050442` and
+its numerical multiples must not be carried forward automatically. See
+`MIGRATION-0.8.7.md` for the migration steps.
 
 ## Previous compatibility
 

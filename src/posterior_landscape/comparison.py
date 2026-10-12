@@ -23,6 +23,12 @@ from .association import (
 )
 from .config import Settings
 from .io import h5py
+from .quadrature import (
+    QUADRATURE_SCHEMA_VERSION,
+    AxisQuadrature,
+    build_axis_quadrature,
+    conservative_remap,
+)
 
 
 @dataclass
@@ -204,8 +210,20 @@ def _projection_in_one_d_measure(
     two_d_measure: str,
     one_d_measure: str,
     log_base: float,
+    cell_axis: AxisQuadrature | None = None,
 ) -> np.ndarray:
     values = np.asarray(projection, dtype=float)
+    if cell_axis is not None:
+        # The independent 1D log measure is natural logarithm.  Converting
+        # finite-volume values through widths preserves each source cell's
+        # probability, including when the 2D log base differs from e.
+        values = values * cell_axis.conversion_factor(
+            two_d_measure,
+            one_d_measure,
+            source_log_base=log_base,
+            target_log_base=math.e,
+        )[None, :]
+        return np.where(np.isfinite(values) & (values > 0.0), values, 0.0)
     if two_d_measure == "log":
         values = values / math.log(log_base)
         if one_d_measure == "linear":
@@ -219,6 +237,10 @@ def _projection_on_one_dimensional_grid(
     projection: np.ndarray,
     source_grid: np.ndarray,
     target_grid: np.ndarray,
+    *,
+    source_axis: AxisQuadrature | None = None,
+    target_axis: AxisQuadrature | None = None,
+    measure: str | None = None,
 ) -> np.ndarray:
     """Interpolate 2D projections onto the independent 1D analysis grid.
 
@@ -231,6 +253,12 @@ def _projection_on_one_dimensional_grid(
     values = np.asarray(projection, dtype=float)
     source = np.asarray(source_grid, dtype=float)
     target = np.asarray(target_grid, dtype=float)
+    if source_axis is not None or target_axis is not None:
+        if source_axis is None or target_axis is None or measure is None:
+            raise ValueError("Finite-cell alignment requires both axes and a measure.")
+        return conservative_remap(
+            values, source_axis, target_axis, measure, log_base=math.e
+        )
     if np.array_equal(source, target):
         return values
     if (
@@ -247,6 +275,63 @@ def _projection_on_one_dimensional_grid(
     for index, row in enumerate(values):
         aligned[index] = np.interp(target, source, row)
     return np.where(np.isfinite(aligned) & (aligned > 0.0), aligned, 0.0)
+
+
+def _aligned_projection(
+    projection: np.ndarray,
+    source_grid: np.ndarray,
+    state: dict[str, Any],
+    settings: Settings,
+    *,
+    two_d_measure: str,
+    log_base: float,
+) -> np.ndarray:
+    """Use the unchanged nodal path or convert/remap finite-cell masses."""
+
+    target_grid = np.asarray(state["m_grid"], dtype=float)
+    if settings.input.grid_location != "cell_centres":
+        return _projection_in_one_d_measure(
+            _projection_on_one_dimensional_grid(
+                projection, source_grid, target_grid
+            ),
+            target_grid,
+            two_d_measure=two_d_measure,
+            one_d_measure=state["MASS_DENSITY_MEASURE"],
+            log_base=log_base,
+        )
+    source_axis = build_axis_quadrature(
+        source_grid,
+        "cell_centres",
+        settings.input.grid_measure,
+        log_base,
+    )
+    target_axis = state.get("CELL_QUADRATURE_AXIS")
+    if target_axis is None:
+        # Serialized target edges, rather than new midpoint inference, also
+        # describe conservatively resampled independent 1D grids correctly.
+        target_axis = build_axis_quadrature(
+            target_grid,
+            "cell_centres",
+            "log",
+            math.e,
+            native_edges=np.asarray(state["logarithmic_cell_edges"], dtype=float),
+        )
+    converted = _projection_in_one_d_measure(
+        projection,
+        source_grid,
+        two_d_measure=two_d_measure,
+        one_d_measure=state["MASS_DENSITY_MEASURE"],
+        log_base=log_base,
+        cell_axis=source_axis,
+    )
+    return _projection_on_one_dimensional_grid(
+        converted,
+        source_grid,
+        target_grid,
+        source_axis=source_axis,
+        target_axis=target_axis,
+        measure=state["MASS_DENSITY_MEASURE"],
+    )
 
 
 def _projection_capture(
@@ -1087,13 +1172,12 @@ def _run_secondary_projection_comparison(
             feature.bounds[common, 0],
             feature.bounds[common, 1],
         )
-        converted = _projection_in_one_d_measure(
-            _projection_on_one_dimensional_grid(
-                feature.projection[common], projection_grid, m_grid
-            ),
-            m_grid,
+        converted = _aligned_projection(
+            feature.projection[common],
+            projection_grid,
+            state,
+            settings,
             two_d_measure=two_d_measure,
-            one_d_measure=state["MASS_DENSITY_MEASURE"],
             log_base=log_base,
         )
         capture = _projection_capture(converted, left[common], right[common], state)
@@ -1479,7 +1563,10 @@ def _signature(
     secondary_manifest: dict[str, Any],
     results: Any,
 ) -> str:
-    digest = hashlib.sha256(b"posterior-landscape-1d-2d-comparison-v4")
+    digest = hashlib.sha256(b"posterior-landscape-1d-2d-comparison-v5")
+    digest.update(QUADRATURE_SCHEMA_VERSION.encode())
+    digest.update(settings.input.grid_location.encode())
+    digest.update(settings.input.grid_measure.encode())
     digest.update(str(one_d_manifest.get("core_signature", "")).encode())
     digest.update(str(secondary_manifest.get("core_signature", "")).encode())
     digest.update(_text(results.attrs.get("fingerprint", "")).encode())
@@ -1490,6 +1577,37 @@ def _signature(
         h0 = np.ascontiguousarray(np.asarray(results["posterior/h0"], dtype="<f8"))
         digest.update(h0.tobytes())
     return digest.hexdigest()
+
+
+def _assert_quadrature_compatibility(
+    settings: Settings,
+    results: Any,
+    manifests: tuple[dict[str, Any], ...],
+    states: tuple[dict[str, Any], ...],
+) -> None:
+    """Never compare cached products from different spatial conventions."""
+
+    expected_location = settings.input.grid_location
+    expected_measure = settings.input.grid_measure
+    records = [dict(results.attrs), *manifests, *states]
+    for record in records:
+        location = _text(record.get("grid_location", "nodes"))
+        measure = _text(record.get("grid_measure", "linear"))
+        if location != expected_location or (
+            location == "cell_centres" and measure != expected_measure
+        ):
+            raise RuntimeError(
+                "1D–2D comparison cannot reuse products with a different "
+                "input grid placement or native cell measure. Use a fresh "
+                "output directory and recompute both workflows."
+            )
+        if location == "cell_centres" and _text(
+            record.get("quadrature_schema_version", "")
+        ) != QUADRATURE_SCHEMA_VERSION:
+            raise RuntimeError(
+                "1D–2D comparison requires compatible finite-volume "
+                "quadrature metadata in every input product."
+            )
 
 
 def run_one_two_dimensional_comparison(
@@ -1514,6 +1632,12 @@ def run_one_two_dimensional_comparison(
     comparison_manifest_path = directory / "one_two_dimensional_manifest.json"
 
     with h5py.File(results_path, "r") as results:
+        _assert_quadrature_compatibility(
+            settings,
+            results,
+            (one_manifest, secondary_manifest),
+            (state, secondary_state),
+        )
         signature = _signature(
             settings, one_manifest, secondary_manifest, results
         )
@@ -1722,13 +1846,12 @@ def run_one_two_dimensional_comparison(
                 feature.bounds[common, 0],
                 feature.bounds[common, 1],
             )
-            converted_projection = _projection_in_one_d_measure(
-                _projection_on_one_dimensional_grid(
-                    feature.projection[common], projection_grid, m_grid
-                ),
-                m_grid,
+            converted_projection = _aligned_projection(
+                feature.projection[common],
+                projection_grid,
+                state,
+                settings,
                 two_d_measure=two_d_measure,
-                one_d_measure=state["MASS_DENSITY_MEASURE"],
                 log_base=log_base,
             )
             capture = _projection_capture(
@@ -1959,6 +2082,19 @@ def run_one_two_dimensional_comparison(
     manifest = {
         "completed": True,
         "signature": signature,
+        "grid_location": settings.input.grid_location,
+        "grid_measure": settings.input.grid_measure,
+        "quadrature_schema_version": QUADRATURE_SCHEMA_VERSION,
+        "projection_measure_conversion": (
+            "conservative_cell_width_ratio"
+            if settings.input.grid_location == "cell_centres"
+            else "legacy_centre_jacobian"
+        ),
+        "projection_grid_alignment": (
+            "conservative_cell_overlap"
+            if settings.input.grid_location == "cell_centres"
+            else "legacy_centre_interpolation"
+        ),
         "matching": (
             "maximum_positive_reference_interval_jaccard_within_morphology_family_"
             "after_finite_region_support_filter"

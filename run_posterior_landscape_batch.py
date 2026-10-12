@@ -574,6 +574,8 @@ def prepare_run_files(
         output_directory,
     )
     stat = density.path.stat()
+    resolved_parser = configparser.ConfigParser(interpolation=None)
+    resolved_parser.read_string(resolved.decode("utf-8"))
     provenance = {
         "input_file": str(density.path),
         "input_size": int(stat.st_size),
@@ -585,6 +587,12 @@ def prepare_run_files(
         "template_settings": str(config.template_settings),
         "template_sha256": _sha256_file(config.template_settings),
         "resolved_settings_sha256": _sha256_bytes(resolved),
+        "grid_location": resolved_parser.get(
+            "input", "grid_location", fallback="nodes"
+        ).strip().lower(),
+        "grid_measure": resolved_parser.get(
+            "input", "grid_measure", fallback="linear"
+        ).strip().lower(),
     }
 
     if provenance_path.exists():
@@ -807,6 +815,32 @@ def _workflow_completion_status(
         return False, "invalid [one_dimensional] enabled setting"
     run_two_d = run_mode in {"2d", "both"}
 
+    grid_location = parser.get(
+        "input", "grid_location", fallback="nodes"
+    ).strip().lower()
+    grid_measure = parser.get(
+        "input", "grid_measure", fallback="linear"
+    ).strip().lower()
+    if grid_location not in {"nodes", "cell_centres"}:
+        return False, "invalid [input] grid_location setting"
+    if grid_measure not in {"linear", "log"}:
+        return False, "invalid [input] grid_measure setting"
+
+    def compatible_quadrature(manifest: dict[str, Any] | None) -> bool:
+        if manifest is None:
+            return False
+        # Missing convention fields describe historical nodal products only.
+        if manifest.get("grid_location", "nodes") != grid_location:
+            return False
+        if manifest.get("grid_measure", "linear") != grid_measure:
+            return False
+        if grid_location == "cell_centres":
+            # Keep the wrapper usable before the package has been installed;
+            # this is the serialized finite-volume schema, not a numerical
+            # quadrature implementation.
+            return manifest.get("quadrature_schema_version") == "1.0"
+        return True
+
     missing: list[str] = []
     if one_d_enabled:
         for name in (
@@ -816,10 +850,14 @@ def _workflow_completion_status(
             manifest = _read_json_dict(output_directory / name)
             if not manifest or not manifest.get("completed_core"):
                 missing.append(name)
+            elif not compatible_quadrature(manifest):
+                missing.append(f"{name} (incompatible quadrature)")
     if run_two_d:
         manifest = _read_json_dict(output_directory / "manifest.json")
         if not manifest or not manifest.get("completed"):
             missing.append("manifest.json")
+        elif not compatible_quadrature(manifest):
+            missing.append("manifest.json (incompatible quadrature)")
         if not (output_directory / "results.h5").is_file():
             missing.append("results.h5")
         if not (
@@ -833,6 +871,8 @@ def _workflow_completion_status(
         )
         if not comparison_manifest or not comparison_manifest.get("completed"):
             missing.append("one_two_dimensional_manifest.json")
+        elif not compatible_quadrature(comparison_manifest):
+            missing.append("one_two_dimensional_manifest.json (incompatible quadrature)")
         for name in (
             "one_two_dimensional_feature_comparison.csv",
             "one_two_dimensional_m2_feature_comparison.csv",

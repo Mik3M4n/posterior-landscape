@@ -11,6 +11,7 @@ from unittest.mock import patch
 import numpy as np
 from test_core import synthetic_density, synthetic_grid
 
+from posterior_landscape import __version__
 from posterior_landscape.config import PlotSettings, load_settings
 from posterior_landscape.ensemble import (
     PosteriorCatalogue,
@@ -692,7 +693,7 @@ write_png = true
                 (output / "manifest.json").read_text(encoding="utf-8")
             )
             self.assertTrue(manifest["completed"])
-            self.assertEqual(manifest["package_version"], "0.8.6")
+            self.assertEqual(manifest["package_version"], __version__)
             self.assertEqual(manifest["global_tail_scale"]["percentile"], 0.999)
             self.assertEqual(manifest["feature_measure"], "log")
             self.assertEqual(manifest["density_measure"], "dlogm1_dlogm2")

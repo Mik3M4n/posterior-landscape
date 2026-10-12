@@ -7,11 +7,11 @@ from typing import Any
 import numpy as np
 
 from .config import Settings
-from .io import open_density_store, validate_store
+from .io import input_to_feature_factor, open_density_store, validate_store
 
 
-def validate_configuration(settings: Settings) -> dict[str, Any]:
-    """Return a compact preflight report without running feature extraction."""
+def validate_configuration(settings: Settings, *, all_draws: bool = False) -> dict[str, Any]:
+    """Audit selected quadrature without extraction; optionally stream every draw."""
 
     if settings.analysis.run == "1d" and not settings.one_dimensional.enabled:
         raise ValueError(
@@ -42,22 +42,76 @@ def validate_configuration(settings: Settings) -> dict[str, Any]:
             raise ValueError(
                 "The independent 1D finder requires positive coordinates."
             )
-        first_weights = np.asarray(grid.input_weight1, dtype=float)
-        second_weights = np.asarray(grid.input_weight2, dtype=float)
-        cell_weights = np.multiply.outer(first_weights, second_weights) * grid.mask
-        indices = np.unique(
-            np.linspace(0, store.number_draws - 1, min(16, store.number_draws)).astype(int)
+        cell_weights = grid.input_cell_weights
+        indices = (
+            np.arange(store.number_draws)
+            if all_draws
+            else np.unique(np.linspace(
+                0, store.number_draws - 1, min(16, store.number_draws)
+            ).astype(int))
         )
-        integrals = np.asarray(
-            [
-                np.sum(
-                    np.where(grid.mask, np.asarray(store.draws[int(index)]), 0.0)
-                    * cell_weights
+        integrals = np.empty(indices.size, dtype=float)
+        conversion_integrals = np.empty(indices.size, dtype=float)
+        maximum_post_error = 0.0
+        maximum_marginal_error = 0.0
+        maximum_raw_marginal_error = 0.0
+        maximum_marginal_conservation_error = 0.0
+        factor = input_to_feature_factor(grid)
+        # Small batches avoid materializing the full PixelPop posterior.
+        for start in range(0, indices.size, 64):
+            chosen = indices[start:start + 64]
+            values = np.stack([
+                np.asarray(store.draws[int(index)], dtype=float) for index in chosen
+            ])
+            valid = values[:, grid.mask]
+            if np.any(~np.isfinite(valid)) or np.any(valid < 0.0):
+                raise ValueError("Audited density draws contain invalid active values.")
+            values = np.where(grid.mask[None, :, :], values, 0.0)
+            raw = np.einsum("bij,ij->b", values, cell_weights)
+            if np.any(~np.isfinite(raw)) or np.any(raw <= 0.0):
+                raise ValueError("Audited density draws have invalid normalization.")
+            integrals[start:start + chosen.size] = raw
+            first = np.einsum("bij,j->bi", values, grid.input_weight2)
+            second = np.einsum("bij,i->bj", values, grid.input_weight1)
+            marginal_integrals = (
+                np.einsum("bi,i->b", first, grid.input_weight1),
+                np.einsum("bj,j->b", second, grid.input_weight2),
+            )
+            maximum_raw_marginal_error = max(maximum_raw_marginal_error, *(
+                float(np.max(np.abs(result - 1.0))) for result in marginal_integrals
+            ))
+            maximum_marginal_conservation_error = max(
+                maximum_marginal_conservation_error, *(
+                    float(np.max(np.abs(result - raw))) for result in marginal_integrals
+                ),
+            )
+            values /= raw[:, None, None]
+            values *= factor[None, :, :]
+            converted = np.einsum("bij,ij->b", values, grid.cell_weights)
+            if np.any(~np.isfinite(converted)) or np.any(converted <= 0.0):
+                raise ValueError("Audited conversion has invalid normalization.")
+            conversion_integrals[start:start + chosen.size] = converted
+            values /= converted[:, None, None]
+            maximum_post_error = max(maximum_post_error, float(np.max(np.abs(
+                np.einsum("bij,ij->b", values, grid.cell_weights) - 1.0
+            ))))
+            first = np.einsum("bij,j->bi", values, grid.weight2)
+            second = np.einsum("bij,i->bj", values, grid.weight1)
+            maximum_marginal_error = max(maximum_marginal_error, *(
+                float(np.max(np.abs(result - 1.0))) for result in (
+                    np.einsum("bi,i->b", first, grid.weight1),
+                    np.einsum("bj,j->b", second, grid.weight2),
                 )
-                for index in indices
-            ],
-            dtype=float,
-        )
+            ))
+        quantiles = np.quantile(integrals, (0.0, 0.05, 0.5, 0.95, 1.0))
+        normalization_report = {
+            "minimum": float(quantiles[0]),
+            "percentile_5": float(quantiles[1]),
+            "median": float(quantiles[2]),
+            "percentile_95": float(quantiles[3]),
+            "maximum": float(quantiles[4]),
+            "maximum_absolute_error_from_one": float(np.max(np.abs(integrals - 1.0))),
+        }
         if settings.analysis.detect_shoulders and (
             np.any(grid.m1 <= 0.0) or np.any(grid.m2 <= 0.0)
         ):
@@ -88,13 +142,25 @@ def validate_configuration(settings: Settings) -> dict[str, Any]:
             "input_density_measure": grid.input_density_measure,
             "feature_measure": grid.feature_measure,
             "geometry": grid.geometry,
-            "sampled_normalization": {
-                "minimum": float(np.min(integrals)),
-                "maximum": float(np.max(integrals)),
-                "maximum_absolute_error_from_one": float(
-                    np.max(np.abs(integrals - 1.0))
-                ),
-            },
+            "grid_location": grid.grid_location,
+            "grid_measure": grid.grid_measure,
+            "quadrature": grid.quadrature_metadata,
+            "audited_draws": int(indices.size),
+            "audit_scope": "all_draws" if all_draws else "representative_draws",
+            "active_mask_cells": grid.quadrature_metadata["active_mask_cells"],
+            "active_diagonal_cells": grid.quadrature_metadata["active_diagonal_cells"],
+            "sampled_normalization": normalization_report,
+            "raw_normalization": normalization_report,
+            "maximum_input_normalization_error": normalization_report[
+                "maximum_absolute_error_from_one"
+            ],
+            "maximum_conversion_normalization_error": float(np.max(np.abs(
+                conversion_integrals - 1.0
+            ))),
+            "maximum_post_normalization_error": maximum_post_error,
+            "maximum_marginal_normalization_error": maximum_marginal_error,
+            "maximum_raw_marginal_normalization_error": maximum_raw_marginal_error,
+            "maximum_marginal_conservation_error": maximum_marginal_conservation_error,
             "external_parameter": {
                 "dataset": settings.association.dataset,
                 "name": settings.association.parameter_name,

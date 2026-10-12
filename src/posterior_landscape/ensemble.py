@@ -11,7 +11,8 @@ import numpy as np
 from scipy import ndimage
 from scipy.optimize import linear_sum_assignment
 
-from .io import DensityStore, Grid, input_to_feature_factor, quadrature_weights
+from .io import DensityStore, Grid, input_to_feature_factor
+from .quadrature import cell_joint_tails, cell_percentile
 from .topology import (
     BranchFeature,
     CurveEventFeature,
@@ -93,6 +94,11 @@ class EnsembleSummary:
     tail_probability: float
     probabilities: tuple[float, float, float]
     maximum_normalization_error: float
+    maximum_post_normalization_error: float = 0.0
+    maximum_marginal_normalization_error: float = 0.0
+    maximum_conversion_normalization_error: float = 0.0
+    reference_post_normalization_error: float = 0.0
+    tail_event_convention: str = "ordered_marginal"
 
 
 def _marginal_percentile(
@@ -201,17 +207,9 @@ def compute_ensemble_summary(
     marginal1 = np.empty((number, grid.m1.size), dtype=float)
     marginal2 = np.empty((number, grid.m2.size), dtype=float)
     cell_weights = grid.cell_weights
-    input_weight1 = (
-        grid.input_weight1
-        if grid.input_weight1 is not None
-        else quadrature_weights(grid.ell1)
-    )
-    input_weight2 = (
-        grid.input_weight2
-        if grid.input_weight2 is not None
-        else quadrature_weights(grid.ell2)
-    )
-    input_cell_weights = np.multiply.outer(input_weight1, input_weight2) * grid.mask
+    input_cell_weights = grid.input_cell_weights
+    maximum_post_error = 0.0
+    maximum_marginal_error = 0.0
     feature_factor = input_to_feature_factor(grid)
 
     for start, batch in store.iter_batches(batch_size):
@@ -243,6 +241,10 @@ def compute_ensemble_summary(
             )
         feature_normalization[start:stop] = converted_integrals
         batch /= converted_integrals[:, None, None]
+        maximum_post_error = max(
+            maximum_post_error,
+            float(np.max(np.abs(np.einsum("bij,ij->b", batch, cell_weights) - 1.0))),
+        )
         marginal1[start:stop] = np.einsum(
             "bij,j->bi", batch, grid.weight2, optimize=True
         )
@@ -250,26 +252,70 @@ def compute_ensemble_summary(
             "bij,i->bj", batch, grid.weight1, optimize=True
         )
 
+    maximum_marginal_error = max(
+        float(np.max(np.abs(np.einsum("bi,i->b", marginal1, grid.weight1) - 1.0))),
+        float(np.max(np.abs(np.einsum("bj,j->b", marginal2, grid.weight2) - 1.0))),
+    )
     alpha = 0.5 * (1.0 - credible_mass)
     probabilities = (alpha, 0.5, 1.0 - alpha)
     marginal1_quantiles = weighted_quantile(marginal1, probabilities, store.weights)
     marginal2_quantiles = weighted_quantile(marginal2, probabilities, store.weights)
 
     if ordered_tails:
-        tail_m1_scale, tail_m1_boundary_limited = _marginal_percentile(
-            marginal1, grid.m1, grid.weight1, tail_probability
-        )
-        tail_m2_scale, tail_m2_boundary_limited = _marginal_percentile(
-            marginal2, grid.m2, grid.weight2, tail_probability
-        )
         tail_mass_grid = np.unique(np.concatenate([grid.m1, grid.m2]))
-        tail_any = _survival_on_grid(
-            marginal1, grid.m1, grid.weight1, tail_mass_grid
-        )
-        tail_both = _survival_on_grid(
-            marginal2, grid.m2, grid.weight2, tail_mass_grid
-        )
-        tail_straddle = np.maximum(tail_any - tail_both, 0.0)
+        if grid.grid_location == "cell_centres":
+            tail_m1_scale = cell_percentile(
+                marginal1, grid.axis1, grid.feature_measure, tail_probability,
+                log_base=grid.log_base,
+            )
+            tail_m2_scale = cell_percentile(
+                marginal2, grid.axis2, grid.feature_measure, tail_probability,
+                log_base=grid.log_base,
+            )
+            # Keep the existing last-two-cells diagnostic, with actual cell edges.
+            tail_m1_boundary_limited = tail_m1_scale >= grid.axis1.edges("linear")[-3]
+            tail_m2_boundary_limited = tail_m2_scale >= grid.axis2.edges("linear")[-3]
+            # Full diagonal bins contain all nominal cell mass; their centres'
+            # ordering cannot replace the actual two-coordinate tail events.
+            tail_any = np.empty((number, tail_mass_grid.size), dtype=float)
+            tail_both = np.empty_like(tail_any)
+            tail_straddle = np.empty_like(tail_any)
+            tail_both_at_m1_scale = np.full(number, np.nan)
+            for start, batch in store.iter_batches(batch_size):
+                stop = start + batch.shape[0]
+                values = np.where(grid.mask[None, :, :], batch, 0.0)
+                values /= normalization[start:stop, None, None]
+                values *= feature_factor[None, :, :]
+                values /= feature_normalization[start:stop, None, None]
+                any_event, both_event, straddle_event = cell_joint_tails(
+                    values, grid.quadrature, grid.feature_measure, tail_mass_grid,
+                    log_base=grid.log_base,
+                )
+                tail_any[start:stop] = any_event
+                tail_both[start:stop] = both_event
+                tail_straddle[start:stop] = straddle_event
+                for local, threshold in enumerate(tail_m1_scale[start:stop]):
+                    if np.isfinite(threshold):
+                        _, joint_both, _ = cell_joint_tails(
+                            values[local], grid.quadrature, grid.feature_measure,
+                            threshold, log_base=grid.log_base,
+                        )
+                        tail_both_at_m1_scale[start + local] = float(joint_both)
+        else:
+            tail_m1_scale, tail_m1_boundary_limited = _marginal_percentile(
+                marginal1, grid.m1, grid.weight1, tail_probability
+            )
+            tail_m2_scale, tail_m2_boundary_limited = _marginal_percentile(
+                marginal2, grid.m2, grid.weight2, tail_probability
+            )
+            tail_any = _survival_on_grid(
+                marginal1, grid.m1, grid.weight1, tail_mass_grid
+            )
+            tail_both = _survival_on_grid(
+                marginal2, grid.m2, grid.weight2, tail_mass_grid
+            )
+        if grid.grid_location != "cell_centres":
+            tail_straddle = np.maximum(tail_any - tail_both, 0.0)
         tail_any_quantiles = weighted_quantile(
             tail_any, probabilities, store.weights
         )
@@ -279,13 +325,17 @@ def compute_ensemble_summary(
         tail_straddle_quantiles = weighted_quantile(
             tail_straddle, probabilities, store.weights
         )
-        tail_both_at_m1_scale = _survival_at_draw_thresholds(
-            marginal2, grid.m2, grid.weight2, tail_m1_scale
-        )
+        if grid.grid_location != "cell_centres":
+            tail_both_at_m1_scale = _survival_at_draw_thresholds(
+                marginal2, grid.m2, grid.weight2, tail_m1_scale
+            )
         target_tail = 1.0 - float(tail_probability)
         tail_both_at_m1_scale = np.clip(
             tail_both_at_m1_scale, 0.0, target_tail
         )
+        # At the first-coordinate percentile this is the primary-only event,
+        # conditional on coordinate1 exceeding its threshold. In finite cells,
+        # it differs from the curve's exactly-one-coordinate (XOR) event.
         tail_straddle_at_m1_scale = np.maximum(
             target_tail - tail_both_at_m1_scale, 0.0
         )
@@ -313,6 +363,10 @@ def compute_ensemble_summary(
         for j0 in range(0, grid.shape[1], tile_size):
             j1 = min(j0 + tile_size, grid.shape[1])
             tile = np.asarray(store.draws[:, i0:i1, j0:j1], dtype=float)
+            if grid.grid_location == "cell_centres":
+                # NPZ arrays expose views, unlike HDF5 slices. Keep the finite-
+                # volume input immutable through subsequent draw-level analysis.
+                tile = tile.copy()
             tile /= normalization[:, None, None]
             tile *= feature_factor[None, i0:i1, j0:j1]
             tile /= feature_normalization[:, None, None]
@@ -340,6 +394,16 @@ def compute_ensemble_summary(
         tail_probability=float(tail_probability),
         probabilities=probabilities,
         maximum_normalization_error=float(np.max(np.abs(normalization - 1.0))),
+        maximum_post_normalization_error=maximum_post_error,
+        maximum_marginal_normalization_error=maximum_marginal_error,
+        maximum_conversion_normalization_error=float(
+            np.max(np.abs(feature_normalization - 1.0))
+        ),
+        reference_post_normalization_error=abs(grid.integrate(reference) - 1.0),
+        tail_event_convention=(
+            "full_cell_overlap" if grid.grid_location == "cell_centres"
+            else "ordered_marginal"
+        ),
     )
 
 
@@ -1689,7 +1753,7 @@ def feature_geometry_maps(
     """Build conditional location HPDs and finite-region inclusion maps."""
 
     physical_area = np.multiply.outer(
-        quadrature_weights(grid.m1), quadrature_weights(grid.m2)
+        grid.linear_weight1, grid.linear_weight2
     )
     physical_area = np.maximum(physical_area, np.finfo(float).tiny)
 

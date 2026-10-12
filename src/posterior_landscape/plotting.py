@@ -61,6 +61,12 @@ def make_global_tail_figure(
         "both": r"$P_{\rm both}(M)=P(m_2>M)$",
         "straddle": r"$P_{\rm straddle}(M)$",
     }
+    if getattr(summary, "tail_event_convention", "ordered_marginal") == "full_cell_overlap":
+        labels = {
+            "any": r"$P_{\rm any}(M)$: either coordinate above $M$",
+            "both": r"$P_{\rm both}(M)$: both coordinates above $M$",
+            "straddle": r"$P_{\rm straddle}(M)$: exactly one above $M$",
+        }
     floor = 1e-8
     for name, quantiles in (
         ("any", summary.tail_any_quantiles),

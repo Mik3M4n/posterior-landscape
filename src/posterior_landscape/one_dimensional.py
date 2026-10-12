@@ -25,8 +25,16 @@ import numpy as np
 
 from . import __version__
 from .association import pairwise_indicator_associations
-from .config import Settings
-from .io import DensityStore, open_density_store
+from .config import Settings, save_settings
+from .io import DensityStore, diagonal_cells, open_density_store
+from .quadrature import (
+    AxisQuadrature,
+    QUADRATURE_SCHEMA_VERSION,
+    build_axis_quadrature,
+    cell_interval_weights,
+    cell_percentile,
+    conservative_remap,
+)
 
 
 _MISSING_H0_WARNING = (
@@ -243,6 +251,17 @@ def _density_signature(
     digest.update(package_version.encode("ascii"))
     digest.update(repr(settings.one_dimensional).encode("utf-8"))
     digest.update(str(settings.analysis.log_base).encode("ascii"))
+    # Input interpretation is part of both independent 1D cache keys.  In
+    # particular, historical states must never be accepted as finite cells.
+    digest.update(settings.input.density_measure.encode("ascii"))
+    digest.update(settings.input.grid_location.encode("ascii"))
+    digest.update(settings.input.grid_measure.encode("ascii"))
+    if settings.input.grid_location == "cell_centres":
+        for coordinates in (store.m1, store.m2):
+            axis = _input_cell_axis(coordinates, settings)
+            _update_hash(digest, axis.edges("linear"), "<f8")
+            _update_hash(digest, axis.weights("log", log_base=math.e), "<f8")
+        digest.update(b"finite-volume-width-ratio-v1")
     _update_hash(digest, store.m1, "<f8")
     _update_hash(digest, store.m2, "<f8")
     _update_hash(digest, store.mask, np.uint8)
@@ -273,10 +292,21 @@ def _core_signature_matches(
     manifest: dict[str, Any] | None,
     current_signature: str,
     legacy_signatures: dict[str, str] | str,
+    *,
+    grid_location: str = "nodes",
+    grid_measure: str = "linear",
 ) -> bool:
     """Accept scientifically identical earlier 1D cores after this patch."""
 
     if not manifest:
+        return False
+    if manifest.get("grid_location", "nodes") != grid_location:
+        return False
+    if grid_location == "cell_centres" and (
+        manifest.get("grid_measure") != grid_measure
+        or manifest.get("quadrature_method") != "finite_volume_cell_widths"
+        or manifest.get("quadrature_schema_version") != QUADRATURE_SCHEMA_VERSION
+    ):
         return False
     if isinstance(legacy_signatures, str):
         legacy_signatures = {"0.6.1": legacy_signatures}
@@ -284,10 +314,106 @@ def _core_signature_matches(
     return bool(
         stored == current_signature
         or (
+            grid_location == "nodes"
+            and
             manifest.get("package_version") in legacy_signatures
             and stored == legacy_signatures[manifest.get("package_version")]
         )
     )
+
+
+def _input_cell_axis(coordinates: np.ndarray, settings: Settings) -> AxisQuadrature:
+    return build_axis_quadrature(
+        coordinates,
+        grid_location="cell_centres",
+        grid_measure=settings.input.grid_measure,
+        log_base=settings.analysis.log_base,
+    )
+
+
+def _cell_component_marginals(
+    store: DensityStore, settings: Settings, *, diagnostics: dict[str, Any] | None = None
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Marginalize finite-cell mass directly into the selected 1D measure.
+
+    The notebook's logarithmic measure is natural logarithm, independently
+    of the configured source logarithm.  Width ratios conserve every input
+    cell's mass before the final numerical normalization safeguard.
+    """
+
+    axis1 = _input_cell_axis(store.m1, settings)
+    axis2 = _input_cell_axis(store.m2, settings)
+    measure = settings.one_dimensional.measure
+    weight1 = axis1.weights(measure, log_base=math.e)
+    weight2 = axis2.weights(measure, log_base=math.e)
+    conversion = np.multiply.outer(
+        axis1.conversion_factor(
+            settings.input.density_measure,
+            measure,
+            source_log_base=settings.analysis.log_base,
+            target_log_base=math.e,
+        ),
+        axis2.conversion_factor(
+            settings.input.density_measure,
+            measure,
+            source_log_base=settings.analysis.log_base,
+            target_log_base=math.e,
+        ),
+    )
+    cell_weights = np.multiply.outer(weight1, weight2) * store.mask
+    input_cell_weights = np.multiply.outer(
+        axis1.weights(settings.input.density_measure),
+        axis2.weights(settings.input.density_measure),
+    ) * store.mask
+    primary = np.empty((store.number_draws, store.m1.size), dtype=np.float64)
+    secondary = np.empty((store.number_draws, store.m2.size), dtype=np.float64)
+    raw_integrals = np.empty(store.number_draws, dtype=float)
+    conversion_factors = np.empty(store.number_draws, dtype=float)
+    maximum_post_error = 0.0
+    batch_size = max(1, min(int(settings.compute.batch_size or 32), store.number_draws))
+    for start, batch in store.iter_batches(batch_size):
+        stop = start + batch.shape[0]
+        active_values = np.asarray(batch, dtype=float)[:, store.mask]
+        if np.any(~np.isfinite(active_values)) or np.any(active_values < 0.0):
+            raise ValueError(
+                "Finite-cell input density must be finite and nonnegative on every active cell."
+            )
+        raw = np.einsum(
+            "bij,ij->b", np.where(store.mask[None, :, :], batch, 0.0),
+            input_cell_weights, optimize=True,
+        )
+        selected = np.where(store.mask[None, :, :], batch * conversion[None, :, :], 0.0)
+        normalization = np.einsum("bij,ij->b", selected, cell_weights, optimize=True)
+        if np.any(~np.isfinite(normalization)) or np.any(normalization <= 0.0):
+            raise RuntimeError("Invalid finite-cell input normalization for the 1D workflow.")
+        raw_integrals[start:stop] = raw
+        conversion_factors[start:stop] = normalization / raw
+        selected /= normalization[:, None, None]
+        primary[start:stop] = np.einsum("bij,j->bi", selected, weight2, optimize=True)
+        secondary[start:stop] = np.einsum("bij,i->bj", selected, weight1, optimize=True)
+        maximum_post_error = max(
+            maximum_post_error,
+            float(np.max(np.abs(np.einsum("bij,ij->b", selected, cell_weights) - 1.0))),
+        )
+        print(f"One-dimensional marginals: {stop}/{store.number_draws} draws.", flush=True)
+    if diagnostics is not None:
+        diagnostics.update(
+            input_normalization_factors=raw_integrals,
+            input_conversion_normalization_factors=conversion_factors,
+            maximum_input_normalization_error=float(np.max(np.abs(raw_integrals - 1.0))),
+            maximum_post_normalization_error=maximum_post_error,
+            maximum_input_conversion_normalization_error=float(np.max(np.abs(conversion_factors - 1.0))),
+            maximum_primary_marginal_normalization_error=float(np.max(np.abs(primary @ weight1 - 1.0))),
+            maximum_secondary_marginal_normalization_error=float(np.max(np.abs(secondary @ weight2 - 1.0))),
+            active_mask_cells=int(np.count_nonzero(store.mask)),
+            active_diagonal_cells=int(np.count_nonzero(store.mask & diagonal_cells(store.m1, store.m2))),
+            ordered_diagonal_cells="full_weight" if settings.input.domain == "ordered" else "not_applicable",
+            input_density_measure=settings.input.density_measure,
+            input_log_base=settings.analysis.log_base,
+            source_quadrature_axes=[axis1.metadata(), axis2.metadata()],
+            raw_input_integral_quantiles=np.quantile(raw_integrals, [0.0, 0.05, 0.5, 0.95, 1.0]).tolist(),
+        )
+    return primary, weight1, secondary, weight2
 
 
 def _write_pickle_atomic(path: Path, payload: Any) -> None:
@@ -345,9 +471,12 @@ def _clear_generated_one_d_outputs(directory: Path) -> None:
 
 
 def _component_mass_marginals(
-    store: DensityStore, settings: Settings
+    store: DensityStore, settings: Settings, *, diagnostics: dict[str, Any] | None = None
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Recover both linear component-mass marginals in one input pass."""
+    """Recover both marginals, retaining the historical nodal calculation."""
+
+    if settings.input.grid_location == "cell_centres":
+        return _cell_component_marginals(store, settings, diagnostics=diagnostics)
 
     dm1 = cell_widths_from_centers(store.m1)
     dm2 = cell_widths_from_centers(store.m2)
@@ -443,6 +572,32 @@ def _geometric_one_dimensional_input(
     return target, resampled, target_widths, True
 
 
+def _finite_cell_one_dimensional_input(
+    axis: AxisQuadrature,
+    samples: np.ndarray,
+    measure: str,
+) -> tuple[AxisQuadrature, np.ndarray, bool]:
+    """Conservatively remap only when constant logarithmic steps are needed.
+
+    The target bins span the original outer edges, rather than the original
+    centres, so endpoint probability remains present in the analysis.
+    """
+
+    differences = np.diff(np.log(axis.centres))
+    if np.allclose(differences, np.median(differences), rtol=1.0e-5, atol=1.0e-12):
+        return axis, samples, False
+    edges = axis.edges("log", log_base=math.e)
+    number = max(axis.centres.size, int(math.ceil((edges[-1] - edges[0]) / np.min(differences))))
+    spacing = (edges[-1] - edges[0]) / number
+    centres = np.exp(edges[0] + (np.arange(number) + 0.5) * spacing)
+    target_axis = build_axis_quadrature(
+        centres, grid_location="cell_centres", grid_measure="log", log_base=math.e,
+        native_edges=np.linspace(edges[0], edges[-1], number + 1),
+    )
+    remapped = conservative_remap(samples, axis, target_axis, measure, log_base=math.e)
+    return target_axis, remapped, True
+
+
 def _base_namespace(
     settings: Settings,
     directory: Path,
@@ -486,11 +641,16 @@ def _notebook_core(
     directory: Path,
     *,
     coordinate: str,
+    quadrature_axis: AxisQuadrature | None = None,
 ) -> dict[str, Any]:
     namespace = _base_namespace(settings, directory, samples, widths)
     namespace["m_grid"] = np.asarray(masses, dtype=float)
     namespace["M_GRID_MIN"] = float(masses[0])
     namespace["M_GRID_MAX"] = float(masses[-1])
+    if quadrature_axis is not None:
+        namespace["CELL_QUADRATURE_AXIS"] = quadrature_axis
+        namespace["_cell_percentile"] = cell_percentile
+        namespace["_cell_interval_weights"] = cell_interval_weights
 
     coordinate_name = (
         settings.input.coordinate1_name
@@ -692,6 +852,27 @@ def _notebook_core(
     )
     state = {name: namespace[name] for name in names}
     state["coordinate"] = coordinate
+    state["grid_location"] = settings.input.grid_location
+    state["grid_measure"] = settings.input.grid_measure
+    state["quadrature_schema_version"] = QUADRATURE_SCHEMA_VERSION
+    state["edges_source"] = "inferred" if quadrature_axis is None else quadrature_axis.edges_source
+    if quadrature_axis is not None:
+        state.update(
+            CELL_QUADRATURE_AXIS=quadrature_axis,
+            quadrature_method="finite_volume_cell_widths",
+            quadrature_log_base=math.e,
+            quadrature_grid_measure=quadrature_axis.grid_measure,
+            physical_cell_edges=quadrature_axis.edges("linear"),
+            logarithmic_cell_edges=quadrature_axis.edges("log", log_base=math.e),
+            linear_quadrature_weights=quadrature_axis.weights("linear"),
+            logarithmic_quadrature_weights=quadrature_axis.weights("log", log_base=math.e),
+            conversion_normalization_factors=namespace["selected_draw_norm_before"],
+            maximum_marginal_normalization_error=float(
+                np.max(np.abs(namespace["selected_draw_norm_after"] - 1.0))
+            ),
+        )
+    else:
+        state["quadrature_method"] = "legacy-notebook-quadrature"
     return state
 
 
@@ -1035,7 +1216,9 @@ def run_one_dimensional(settings: Settings) -> OneDimensionalResult:
         for coordinate in ("m1", "m2"):
             manifest = manifests[coordinate]
             matches = _core_signature_matches(
-                manifest, core_signature, legacy_signatures
+                manifest, core_signature, legacy_signatures,
+                grid_location=settings.input.grid_location,
+                grid_measure=settings.input.grid_measure,
             )
             reusable[coordinate] = bool(
                 manifest
@@ -1055,6 +1238,7 @@ def run_one_dimensional(settings: Settings) -> OneDimensionalResult:
                     "or choose another output directory."
                 )
 
+        save_settings(settings, directory / "settings.ini")
         states: dict[str, dict[str, Any]] = {}
         for coordinate in ("m1", "m2"):
             if reusable[coordinate]:
@@ -1080,7 +1264,16 @@ def run_one_dimensional(settings: Settings) -> OneDimensionalResult:
                 "marginals from "
                 f"{store.number_draws} posterior draws."
             )
-            pm1, dm1, pm2, dm2 = _component_mass_marginals(store, settings)
+            quadrature_diagnostics: dict[str, Any] = {}
+            if settings.input.grid_location == "cell_centres":
+                print("Input grid placement: cell centres")
+                print(f"Native cell coordinate: {settings.input.grid_measure}")
+                print("Quadrature: finite-volume cell widths; conservative cell-measure conversion")
+                if settings.input.domain == "ordered":
+                    print("Ordered diagonal cells: full weight")
+            pm1, dm1, pm2, dm2 = _component_mass_marginals(
+                store, settings, diagnostics=quadrature_diagnostics
+            )
             inputs = {
                 "m1": (store.m1, pm1, dm1),
                 "m2": (store.m2, pm2, dm2),
@@ -1094,9 +1287,20 @@ def run_one_dimensional(settings: Settings) -> OneDimensionalResult:
                     "feature finder."
                 )
                 masses, samples, widths = inputs[coordinate]
-                masses, samples, widths, resampled = (
-                    _geometric_one_dimensional_input(masses, samples, widths)
-                )
+                quadrature_axis = None
+                if settings.input.grid_location == "cell_centres":
+                    quadrature_axis, samples, resampled = _finite_cell_one_dimensional_input(
+                        _input_cell_axis(masses, settings), samples,
+                        settings.one_dimensional.measure,
+                    )
+                    masses = quadrature_axis.centres
+                    widths = quadrature_axis.weights(
+                        settings.one_dimensional.measure, log_base=math.e
+                    )
+                else:
+                    masses, samples, widths, resampled = (
+                        _geometric_one_dimensional_input(masses, samples, widths)
+                    )
                 if resampled:
                     print(
                         f"Resampled the {coordinate_names[coordinate]} marginal from "
@@ -1110,7 +1314,9 @@ def run_one_dimensional(settings: Settings) -> OneDimensionalResult:
                     settings,
                     directory,
                     coordinate=coordinate,
+                    quadrature_axis=quadrature_axis,
                 )
+                state.update(quadrature_diagnostics)
                 states[coordinate] = state
                 _write_pickle_atomic(state_paths[coordinate], state)
                 manifest = {
@@ -1131,6 +1337,13 @@ def run_one_dimensional(settings: Settings) -> OneDimensionalResult:
                     "input_file": str(settings.input.file),
                     "number_draws": store.number_draws,
                     "measure": settings.one_dimensional.measure,
+                    "grid_location": settings.input.grid_location,
+                    "grid_measure": settings.input.grid_measure,
+                    "quadrature_method": state["quadrature_method"],
+                    "quadrature_schema_version": QUADRATURE_SCHEMA_VERSION,
+                    "edges_source": state["edges_source"],
+                    "source_edges_source": "inferred" if quadrature_axis is not None else "not_applicable",
+                    "resampled_for_logarithmic_smoothing": resampled,
                     "upper_tail_percentile": (
                         settings.one_dimensional.upper_tail_percentile
                     ),
@@ -1153,6 +1366,23 @@ def run_one_dimensional(settings: Settings) -> OneDimensionalResult:
                     "h0_signature": None,
                     "h0_available": False,
                 }
+                if quadrature_axis is not None:
+                    manifest.update({
+                        key: value for key, value in quadrature_diagnostics.items()
+                        if not isinstance(value, np.ndarray)
+                    })
+                    manifest.update(
+                        physical_cell_edges=state["physical_cell_edges"].tolist(),
+                        logarithmic_cell_edges=state["logarithmic_cell_edges"].tolist(),
+                        quadrature_weights=state["MASS_MEASURE_WIDTHS"].tolist(),
+                        quadrature_log_base=math.e,
+                        maximum_conversion_normalization_error=float(
+                            np.max(np.abs(state["conversion_normalization_factors"] - 1.0))
+                        ),
+                        maximum_marginal_normalization_error=state[
+                            "maximum_marginal_normalization_error"
+                        ],
+                    )
                 manifests[coordinate] = manifest
                 _write_manifest(manifest_paths[coordinate], manifest)
 

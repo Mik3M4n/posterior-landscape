@@ -1,5 +1,49 @@
 # LVK compatibility and release gate
 
+## 0.8.7 grid-placement compatibility
+
+Finite-volume behavior is strictly opt-in through
+`input.grid_location = cell_centres`. If that setting is absent or is
+`nodes`, the 0.8.6 scientific numerical behavior must be reproduced within
+the existing regression tolerances. This includes the 2D catalogue,
+posterior support, finite-region measurements, independent notebook-based
+1D analyses, projections, tails, and external-parameter association outputs.
+The centre-evaluated density Jacobian and nodal trapezoidal weights remain
+unchanged. `input.grid_measure` has no numerical effect in `nodes` mode;
+metadata, version strings, fingerprints, logs, and reuse decisions may change.
+
+Analytic densities sampled at nodes, the spectral reconstruction, and the
+synthetic validation suite therefore retain their existing default
+quadrature. The generic and GW example settings explicitly use `nodes`.
+Only the PixelPop finite-volume example enables `cell_centres`.
+
+In finite-cell mode, native edges are inferred once, then transformed to
+physical/logarithmic coordinates. Measure conversion preserves each cell's
+probability exactly by multiplying density by the ratio of source to target
+axis widths. All active mask cells have full area, including ordered diagonal
+cells; no clipping, half-weighting, strict-mask substitution, or HDF5 change
+is part of the conversion. Posterior-draw `weights` retain their existing
+meaning.
+
+Full nominal ordered diagonal cells can contain points on both sides of the
+continuous ordering line. Finite-cell either/both/exactly-one exceedance tails
+therefore use joint axis interval-overlap products, without diagonal clipping,
+rather than marginal ordering identities. The primary-tail composition is
+still conditional on primary-coordinate exceedance and is distinct from the
+overall exactly-one tail. Nodal tail summaries retain their existing rules.
+
+Explicit `domain = ordered` accepts `coordinate2 <= coordinate1` with a small
+floating-point boundary tolerance. The historical missing-mask strict
+triangle of `domain = legacy` remains unchanged.
+
+Quadrature settings and construction metadata participate in run and cache
+signatures. Incompatible completed outputs, topology checkpoints, independent
+1D caches, projection comparisons, and batch skip decisions cannot be reused
+after a convention change. Historical products may be recognized only as
+nodal products under the appropriate compatibility checks, never as finite
+cells. A new PixelPop output directory is required for migration; see
+`MIGRATION-0.8.7.md`.
+
 ## Frozen settings
 
 The supplied v0.7 GW configuration resolves in v0.8 to the same scientific

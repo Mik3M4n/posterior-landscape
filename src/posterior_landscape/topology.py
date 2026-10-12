@@ -12,7 +12,7 @@ from scipy.interpolate import RegularGridInterpolator
 from scipy.linalg import solve_banded
 from scipy.signal import find_peaks
 
-from .io import Grid, normalize_density, quadrature_weights
+from .io import Grid, normalize_density
 
 try:
     import numba as _numba
@@ -1438,7 +1438,7 @@ def _point_feature_geometry(
         return
 
     physical_weights = np.multiply.outer(
-        quadrature_weights(grid.m1), quadrature_weights(grid.m2)
+        grid.linear_weight1, grid.linear_weight2
     )
     weights = np.where(region, physical_weights, 0.0)
     area = float(np.sum(weights))

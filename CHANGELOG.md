@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.8.7 — 2026-10-12
+
+- Add explicit finite-volume input support with `input.grid_location =
+  cell_centres` and native `input.grid_measure = linear` or `log`. Cell edges
+  are inferred once in the native coordinate; all integration widths refer
+  to the same physical bins.
+- Preserve each finite cell's probability during density-measure conversion
+  using axis-width ratios. Retain the existing centre Jacobian and
+  trapezoidal quadrature in default `nodes` mode; `grid_measure` has no
+  numerical effect in that mode.
+- Propagate the selected quadrature through normalization, reference fields,
+  support regions, finite-region moments, physical areas, marginals, the
+  independent 1D workflow, projections, interval capture, and tail summaries.
+- Compute finite-cell joint either/both/exactly-one tail probabilities from
+  axis interval-overlap products, retaining full diagonal bins. Keep the
+  primary-tail conditional composition separate from the overall
+  exactly-one curve; retain the existing nodal tail calculation.
+- Accept inclusive ordered masks, including floating-point boundary
+  tolerance. Every active finite cell, including a diagonal cell, receives
+  its full nominal area; no geometric clipping is inferred.
+- Record the quadrature convention, inferred edges and weights, active and
+  diagonal cell counts, and normalization diagnostics in numerical outputs
+  and metadata. Add all-draw validation with
+  `posterior-landscape validate settings.ini --all-draws --json`.
+- Include quadrature semantics in fingerprints and resume/cache guards,
+  including independent 1D, projection comparison, and batch reuse.
+- Add a PixelPop baseline example and migration instructions. PixelPop must
+  be rerun in a fresh output directory with automatic persistence selection;
+  previous numerical thresholds are not carried forward.
+
 ## 0.8.6 — 2026-08-20
 
 - Preserve draw-level comparison and global-tail products in the full output

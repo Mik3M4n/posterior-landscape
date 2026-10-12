@@ -1275,11 +1275,17 @@ for _feature_id in feature_posterior_order:
 
     # Allocate each full quadrature weight in proportion to the fraction
     # of its selected-coordinate cell covered by the moving interval.
-    _overlap = (
-        MASS_MEASURE_WIDTHS[None, :]
-        * _overlap_coordinate_width
-        / MASS_MEASURE_CELL_WIDTHS[None, :]
-    )
+    if "CELL_QUADRATURE_AXIS" in globals():
+        _overlap = _cell_interval_weights(
+            CELL_QUADRATURE_AXIS, MASS_DENSITY_MEASURE,
+            _left, _right, log_base=np.e,
+        )
+    else:
+        _overlap = (
+            MASS_MEASURE_WIDTHS[None, :]
+            * _overlap_coordinate_width
+            / MASS_MEASURE_CELL_WIDTHS[None, :]
+        )
 
     _density = pm1_draw_feature_density[_bounded_indices]
     _probability = np.einsum(

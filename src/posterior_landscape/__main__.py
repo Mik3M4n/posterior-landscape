@@ -29,12 +29,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     validate_parser.add_argument("settings", help="Path to settings.ini")
     validate_parser.add_argument("--json", action="store_true", dest="as_json")
+    validate_parser.add_argument(
+        "--all-draws", action="store_true",
+        help="Stream and audit every density draw, without feature extraction",
+    )
     arguments = parser.parse_args(arguments_text)
 
     try:
         settings = load_settings(arguments.settings)
         if arguments.command == "validate":
-            report = validate_configuration(settings)
+            report = validate_configuration(settings, all_draws=arguments.all_draws)
             if arguments.as_json:
                 print(json.dumps(report, indent=2, sort_keys=True))
             else:
@@ -43,6 +47,26 @@ def main(argv: list[str] | None = None) -> int:
                     f"{report['shape'][1]}; domain={report['domain']}; "
                     f"input measure={report['input_density_measure']}; "
                     f"external={report['external_parameter']['available']}."
+                )
+                print(
+                    f"Grid placement: {report['grid_location']}; native measure: "
+                    f"{report['grid_measure']}; "
+                    f"quadrature={report['quadrature']['quadrature_method']}; "
+                    f"active cells={report['active_mask_cells']}; "
+                    f"diagonal cells={report['active_diagonal_cells']}."
+                )
+                audit = report["raw_normalization"]
+                print(
+                    f"Raw integrals ({report['audited_draws']} audited draws): "
+                    f"min={audit['minimum']:.12g}, p05={audit['percentile_5']:.12g}, "
+                    f"median={audit['median']:.12g}, p95={audit['percentile_95']:.12g}, "
+                    f"max={audit['maximum']:.12g}; "
+                    f"maximum error={report['maximum_input_normalization_error']:.6g}."
+                )
+                print(
+                    f"Post-normalization error={report['maximum_post_normalization_error']:.6g}; "
+                    f"marginal-normalization error="
+                    f"{report['maximum_marginal_normalization_error']:.6g}."
                 )
                 for warning in report["warnings"]:
                     print(f"WARNING: {warning}")
