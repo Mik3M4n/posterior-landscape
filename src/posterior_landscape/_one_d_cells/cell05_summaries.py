@@ -114,10 +114,12 @@ for _feature_id in FEATURE_SUMMARY_ORDER:
         _bounded,
     )
 
-    if _number_probability == 0:
-        raise RuntimeError(
-            f"No bounded moving-band probabilities for {_feature_id}."
-        )
+    #if _number_probability == 0:
+    #    raise RuntimeError(
+    #        f"No bounded moving-band probabilities for {_feature_id}."
+    #    )
+    # Zero bounded support is a valid posterior outcome.
+    # Keep the feature in the summary with N=0 and NaN quantiles.
 
     _probability_rows.append(
         {
