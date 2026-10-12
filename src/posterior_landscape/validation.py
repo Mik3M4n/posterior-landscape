@@ -33,7 +33,7 @@ def validate_configuration(settings: Settings) -> dict[str, Any]:
         )
         if settings.analysis.ordered_tails and not grid.ordered_domain:
             raise ValueError(
-                "analysis.ordered_tails=true requires coordinate2 < coordinate1 "
+                "analysis.ordered_tails=true requires coordinate2 <= coordinate1 "
                 "throughout the valid domain."
             )
         if settings.one_dimensional.enabled and (

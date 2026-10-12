@@ -145,12 +145,12 @@ def _domain_mask(
             )
         return np.ones((first.size, second.size), dtype=bool)
     if domain == "ordered":
-        expected = second[None, :] < first[:, None]
+        expected = second[None, :] <= first[:, None]
         if supplied is not None:
             if np.any(supplied & ~expected):
                 raise ValueError(
                     "input.domain=ordered requires every valid mask cell to "
-                    "satisfy coordinate2 < coordinate1."
+                    "satisfy coordinate2 <= coordinate1."
                 )
             # A supplied mask may further restrict an ordered domain. This is
             # the same mask-first behavior used by v0.7, while making the
@@ -444,7 +444,7 @@ def validate_store(
         ell2 if input_density_measure == "log" else store.m2
     )
     ordered_domain = bool(
-        np.all(~store.mask | (store.m2[None, :] < store.m1[:, None]))
+        np.all(~store.mask | (store.m2[None, :] <= store.m1[:, None]))
     )
 
     grid = Grid(

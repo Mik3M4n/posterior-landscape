@@ -3547,7 +3547,7 @@ def _run_two_dimensional(settings: Settings) -> Path:
         if settings.analysis.ordered_tails and not grid.ordered_domain:
             raise ValueError(
                 "analysis.ordered_tails=true requires an ordered domain with "
-                "coordinate2 < coordinate1 everywhere inside the mask."
+                "coordinate2 <= coordinate1 everywhere inside the mask."
             )
         if settings.association.enabled == "off":
             store.h0 = None
