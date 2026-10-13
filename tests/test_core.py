@@ -183,7 +183,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(len(reference.events), 1)
         self.assertEqual(reference.events[0].arm_indices, (0, 1))
 
-    def test_branch_matching_does_not_substitute_boundary_connectivity(self) -> None:
+    def test_legacy_branch_matching_rejects_boundary_role_changes(self) -> None:
         interior = self._test_branch((8, 7), scale_count=3)
         boundary = self._test_branch(
             (8, 7), scale_count=3, extremum_boundary_type="mask"

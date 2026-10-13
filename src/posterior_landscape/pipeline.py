@@ -35,6 +35,8 @@ from .association import (
     pairwise_indicator_associations,
 )
 from .config import AnalysisSettings, Settings, load_settings, save_settings
+from .boundary import RIDGE_REGION_SCHEMA_VERSION, boundary_contacts
+from .matching import MATCHING_SCHEMA_VERSION
 from .ensemble import (
     BranchTracker,
     EnsembleSummary,
@@ -132,6 +134,7 @@ def _analysis_options(
         "shoulder_alpha_threshold": settings.shoulder_alpha_threshold,
         "shoulder_scales": settings.scales,
         "detect_shoulders": settings.detect_shoulders,
+        "ridge_region_policy": settings.ridge_region_policy,
     }
 
 
@@ -160,6 +163,9 @@ def _fingerprint(settings: Settings, input_shape: tuple[int, ...]) -> str:
     digest.update(__version__.encode())
     # Resolved input semantics also protect programmatic settings replacements.
     digest.update(json.dumps(asdict(settings.input), sort_keys=True, default=str).encode())
+    digest.update(json.dumps(asdict(settings.analysis), sort_keys=True, default=str).encode())
+    digest.update(f"connection-matching-schema-{MATCHING_SCHEMA_VERSION}".encode())
+    digest.update(f"ridge-region-schema-{RIDGE_REGION_SCHEMA_VERSION}".encode())
     digest.update(b"spatial-quadrature-schema-1.0")
     if settings.input.grid_location == "cell_centres":
         digest.update(b"full-cell-overlap-tail-events-v1")
@@ -290,6 +296,8 @@ def _save_checkpoint(
     fingerprint: str,
     next_draw: int,
     catalogue: PosteriorCatalogue,
+    matching_policy: str | None = None,
+    ridge_region_policy: str = "mask_supported",
 ) -> None:
     temporary = path.with_suffix(".tmp")
     payload = {
@@ -297,6 +305,10 @@ def _save_checkpoint(
         "fingerprint": fingerprint,
         "next_draw": int(next_draw),
         "catalogue": catalogue,
+        "matching_schema_version": MATCHING_SCHEMA_VERSION,
+        "ridge_region_schema_version": RIDGE_REGION_SCHEMA_VERSION,
+        "matching_policy": matching_policy or getattr(catalogue, "matching_policy", "legacy"),
+        "ridge_region_policy": ridge_region_policy,
     }
     with gzip.open(temporary, "wb", compresslevel=1) as stream:
         pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
@@ -304,7 +316,9 @@ def _save_checkpoint(
 
 
 def _load_checkpoint(
-    path: Path, fingerprint: str
+    path: Path, fingerprint: str, *,
+    matching_policy: str | None = None,
+    ridge_region_policy: str | None = None,
 ) -> tuple[int, PosteriorCatalogue] | None:
     if not path.is_file():
         return None
@@ -316,6 +330,16 @@ def _load_checkpoint(
         raise ValueError(
             "The existing checkpoint belongs to different input or settings. "
             "Choose another output directory or set overwrite=true."
+        )
+    if (
+        payload.get("matching_schema_version") != MATCHING_SCHEMA_VERSION
+        or payload.get("ridge_region_schema_version") != RIDGE_REGION_SCHEMA_VERSION
+        or (matching_policy is not None and payload.get("matching_policy") != matching_policy)
+        or (ridge_region_policy is not None and payload.get("ridge_region_policy") != ridge_region_policy)
+    ):
+        raise ValueError(
+            "The checkpoint uses different or missing matching/region conventions. "
+            "Choose a fresh output directory or set overwrite=true."
         )
     return int(payload["next_draw"]), payload["catalogue"]
 
@@ -2376,6 +2400,36 @@ def _dataset(group: Any, name: str, values: np.ndarray) -> None:
     group.create_dataset(name, data=values, **options)
 
 
+def _write_ridge_boundary_metadata(group: Any, tracker: Any) -> None:
+    """Keep domain closure separate from density crossings and contrast validity."""
+    template = tracker.template
+    group.attrs["region_policy"] = getattr(template, "region_policy", "legacy_two_sided")
+    group.attrs["reference_strength_reference"] = getattr(template, "strength_reference", "")
+    group.attrs["reference_strength_valid"] = bool(getattr(template, "strength_valid", False))
+    group.attrs["reference_boundary_bounded_fraction"] = float(
+        getattr(template, "boundary_bounded_fraction", 0.0)
+    )
+    if hasattr(template, "width_reference"):
+        group.attrs["reference_width_reference"] = template.width_reference
+    for name in ("window_mask",):
+        region = getattr(template, name, None)
+        if region is not None:
+            _dataset(group, "reference_" + name, region)
+    for name in (
+        "boundary_bounded_fraction", "strength_valid", "strength_reference", "width_reference",
+        "boundary_left_profiles", "boundary_right_profiles",
+    ):
+        if hasattr(tracker, name):
+            _dataset(group, name, getattr(tracker, name))
+    for name in (
+        "section_left_boundary_bounded", "section_right_boundary_bounded",
+        "section_strength_valid", "section_left_boundary_type", "section_right_boundary_type",
+        "section_left_reference", "section_right_reference",
+    ):
+        if hasattr(template, name):
+            _dataset(group, "reference_" + name, getattr(template, name))
+
+
 def _store_location_configuration(
     group: Any, result: LocationConfigurationResult
 ) -> None:
@@ -2464,7 +2518,16 @@ def _write_numerical_results(
     chain_id: np.ndarray | None,
     h0_records: list[dict[str, Any]],
     location_configurations: dict[str, LocationConfigurationResult],
+    matching_policy: str = "coherent",
+    ridge_region_policy: str = "mask_supported",
+    matching_diagnostics: dict[str, Any] | None = None,
 ) -> Path:
+    policy_metadata = {
+        "matching_policy": matching_policy,
+        "matching_schema_version": MATCHING_SCHEMA_VERSION,
+        "ridge_region_policy": ridge_region_policy,
+        "ridge_region_schema_version": RIDGE_REGION_SCHEMA_VERSION,
+    }
     if h5py is None:  # Useful for lightweight source-tree testing.
         path = directory / "results.npz"
         payload: dict[str, Any] = dict(
@@ -2548,6 +2611,8 @@ def _write_numerical_results(
             topology_sample_signature=topology_sample_signature,
         )
         payload.update(_quadrature_output_arrays(grid))
+        payload.update(policy_metadata)
+        payload["matching_diagnostics"] = json.dumps(matching_diagnostics or {}, sort_keys=True)
         payload["grid_location"] = grid.grid_location
         payload["grid_measure"] = grid.grid_measure
         payload["quadrature_schema_version"] = "1.0"
@@ -2575,6 +2640,13 @@ def _write_numerical_results(
         output.attrs["completed"] = True
         output.attrs["fingerprint"] = fingerprint
         output.attrs["topology_sample_signature"] = topology_sample_signature
+        for name, value in policy_metadata.items():
+            output.attrs[name] = value
+        output.attrs["matching_diagnostics"] = json.dumps(matching_diagnostics or {}, sort_keys=True)
+        output.attrs["ridge_width_definition"] = (
+            "supported_half_prominence_or_domain_boundary"
+            if ridge_region_policy == "mask_supported" else "two_sided_half_prominence"
+        )
         output.attrs["input_density_measure"] = grid.input_density_measure
         output.attrs["density_measure"] = _density_measure_name(
             grid.feature_measure
@@ -2721,6 +2793,12 @@ def _write_numerical_results(
         features = output.create_group("features")
         for tracker in points:
             group = features.create_group(tracker.template.identifier)
+            group.attrs["reference_boundary_contacts"] = json.dumps(boundary_contacts(
+                np.asarray([
+                    grid.geometry1[tracker.template.index[0]],
+                    grid.geometry2[tracker.template.index[1]],
+                ]), grid,
+            ))
             group.attrs["type"] = tracker.template.kind
             group.attrs["status"] = _feature_status(tracker.template)
             group.attrs["reference_boundary_type"] = tracker.template.boundary_type
@@ -2805,6 +2883,14 @@ def _write_numerical_results(
         event_group = output.create_group("events")
         for tracker in events:
             group = event_group.create_group(tracker.template.identifier)
+            group.attrs["reference_boundary_contacts"] = json.dumps([
+                boundary_contacts(point, grid) for point in tracker.template.topology_geometry
+            ])
+            if tracker.template.kind == "ridge":
+                _write_ridge_boundary_metadata(group, tracker)
+                group.attrs["strength_support"] = float(np.sum(weights[
+                    tracker.present & tracker.strength_valid
+                ]))
             group.attrs["type"] = tracker.template.kind
             group.attrs["arms"] = "+".join(tracker.template.arm_identifiers)
             group.attrs["projection_weight"] = (
@@ -2950,6 +3036,18 @@ def _write_numerical_results(
                     group.attrs[name] = value
         for tracker in branches:
             group = features.create_group(tracker.template.identifier)
+            group.attrs["reference_saddle_boundary_type"] = tracker.template.saddle_boundary_type
+            group.attrs["reference_saddle_boundary_contacts"] = json.dumps(
+                boundary_contacts(tracker.template.topology_points_geometry[0], grid)
+            )
+            group.attrs["reference_extremum_boundary_contacts"] = json.dumps(
+                boundary_contacts(tracker.template.topology_points_geometry[-1], grid)
+            )
+            if tracker.template.kind == "ridge":
+                _write_ridge_boundary_metadata(group, tracker)
+                group.attrs["strength_support"] = float(np.sum(weights[
+                    tracker.present & tracker.strength_valid
+                ]))
             group.attrs["type"] = tracker.template.kind
             group.attrs["status"] = _feature_status(tracker.template)
             group.attrs["reference_boundary_type"] = tracker.template.boundary_type
@@ -3106,6 +3204,56 @@ def _release_series(version: Any) -> tuple[str, str] | None:
     return (pieces[0], pieces[1]) if len(pieces) >= 2 else None
 
 
+def _boundary_policy_metadata(
+    settings: Settings,
+) -> dict[str, str]:
+    return {
+        "matching_policy": settings.analysis.matching_policy,
+        "matching_schema_version": MATCHING_SCHEMA_VERSION,
+        "ridge_region_policy": settings.analysis.ridge_region_policy,
+        "ridge_region_schema_version": RIDGE_REGION_SCHEMA_VERSION,
+    }
+
+
+def _boundary_policy_compatibility(
+    metadata: Any, settings: Settings,
+) -> tuple[bool, str]:
+    """Missing historical policies mean legacy, never the new defaults."""
+    expected = _boundary_policy_metadata(settings)
+    legacy = {"matching_policy": "legacy", "ridge_region_policy": "legacy_two_sided"}
+    for name, old in legacy.items():
+        value = _hdf5_text(metadata.get(name, old))
+        if value != expected[name]:
+            return False, f"the {name} changed or is missing"
+    for name, policy, old in (
+        ("matching_schema_version", "matching_policy", "legacy"),
+        ("ridge_region_schema_version", "ridge_region_policy", "legacy_two_sided"),
+    ):
+        value = metadata.get(name)
+        if value is None and expected[policy] == old:
+            continue
+        if _hdf5_text(value) != expected[name]:
+            return False, f"the {name} changed or is missing"
+    return True, ""
+
+
+def _completed_boundary_policy_compatibility(
+    directory: Path, manifest: dict[str, Any], settings: Settings,
+) -> tuple[bool, str]:
+    compatible, reason = _boundary_policy_compatibility(manifest, settings)
+    if not compatible:
+        return compatible, reason
+    results = directory / "results.h5"
+    if h5py is not None and results.is_file():
+        with h5py.File(results, "r") as handle:
+            return _boundary_policy_compatibility(handle.attrs, settings)
+    results_npz = directory / "results.npz"
+    if results_npz.is_file():
+        with np.load(results_npz, allow_pickle=False) as handle:
+            return _boundary_policy_compatibility(handle, settings)
+    return False, "numerical results are unavailable for matching/region checks"
+
+
 def _completed_topology_compatibility(
     directory: Path,
     manifest: dict[str, Any],
@@ -3114,6 +3262,12 @@ def _completed_topology_compatibility(
     grid: Grid,
 ) -> tuple[bool, str, str]:
     """Check whether a completed same-release catalogue can be reused safely."""
+
+    policy_ok, policy_reason = _completed_boundary_policy_compatibility(
+        directory, manifest, settings
+    )
+    if not policy_ok:
+        return False, "", policy_reason
 
     results_path = directory / "results.h5"
     settings_copy = directory / "settings.ini"
@@ -3139,6 +3293,8 @@ def _completed_topology_compatibility(
     current_analysis = dict(vars(settings.analysis))
     previous_analysis.pop("run", None)
     current_analysis.pop("run", None)
+    previous_analysis["matching_policy"] = manifest.get("matching_policy", "legacy")
+    previous_analysis["ridge_region_policy"] = manifest.get("ridge_region_policy", "legacy_two_sided")
     if previous_analysis != current_analysis:
         return False, "", "the two-dimensional analysis settings changed"
     try:
@@ -3697,7 +3853,10 @@ def _run_two_dimensional(settings: Settings) -> Path:
                     store.chain_id,
                 )
             )
-            if existing_manifest.get("fingerprint") == fingerprint and (
+            policy_ok, _ = _completed_boundary_policy_compatibility(
+                directory, existing_manifest, settings
+            )
+            if policy_ok and existing_manifest.get("fingerprint") == fingerprint and (
                 store.h0 is None or h0_current
             ):
                 if store.h0 is None:
@@ -3877,14 +4036,20 @@ def _run_two_dimensional(settings: Settings) -> Path:
                     settings.analysis.scales if scale_index == 0 else (scale,)
                 ),
                 detect_shoulders=settings.analysis.detect_shoulders,
+                ridge_region_policy=settings.analysis.ridge_region_policy,
             )
             for scale_index, scale in enumerate(settings.analysis.scales)
         ]
         reference = reference_analyses[0]
-        add_scale_persistence(reference, reference_analyses[1:], grid)
+        reference_matching_diagnostics = add_scale_persistence(
+            reference, reference_analyses[1:], grid,
+            matching_policy=settings.analysis.matching_policy,
+        )
         scale_filter = retain_scale_persistent_reference(reference)
         boundary_filter = remove_corner_boundary_pits(reference)
-        assign_reference_identifiers(reference, grid)
+        assign_reference_identifiers(
+            reference, grid, matching_policy=settings.analysis.matching_policy,
+        )
         logger.info(
             (
                 "Reference multiscale filter: required %d/%d scales; "
@@ -3895,6 +4060,12 @@ def _run_two_dimensional(settings: Settings) -> Path:
             scale_filter["points_removed"],
             scale_filter["branches_removed"],
         )
+        logger.info(
+            "Connection matching: %s (schema %s); ridge regions: %s (schema %s).",
+            settings.analysis.matching_policy, MATCHING_SCHEMA_VERSION,
+            settings.analysis.ridge_region_policy, RIDGE_REGION_SCHEMA_VERSION,
+        )
+        logger.info("Reference matching diagnostics: %s", reference_matching_diagnostics)
         if boundary_filter["corner_pits_removed"]:
             logger.info(
                 (
@@ -3977,14 +4148,19 @@ def _run_two_dimensional(settings: Settings) -> Path:
 
         checkpoint_path = directory / ".posterior_landscape.checkpoint.pkl.gz"
         checkpoint = (
-            _load_checkpoint(checkpoint_path, fingerprint)
+            _load_checkpoint(
+                checkpoint_path, fingerprint,
+                matching_policy=settings.analysis.matching_policy,
+                ridge_region_policy=settings.analysis.ridge_region_policy,
+            )
             if settings.compute.resume and not settings.output.overwrite
             else None
         )
         if checkpoint is None:
             next_draw = 0
             catalogue = PosteriorCatalogue.from_reference(
-                reference, store.number_draws, grid
+                reference, store.number_draws, grid,
+                matching_policy=settings.analysis.matching_policy,
             )
         else:
             next_draw, catalogue = checkpoint
@@ -4040,6 +4216,8 @@ def _run_two_dimensional(settings: Settings) -> Path:
                         fingerprint=fingerprint,
                         next_draw=stop,
                         catalogue=catalogue,
+                        matching_policy=settings.analysis.matching_policy,
+                        ridge_region_policy=settings.analysis.ridge_region_policy,
                     )
                     last_checkpoint = stop
                     checkpoint_time = now
@@ -4062,6 +4240,11 @@ def _run_two_dimensional(settings: Settings) -> Path:
             else 1.5 * grid.typical_spacing
         )
         logger.info("Computing ridge and valley posterior probability maps.")
+        matching_diagnostics = {
+            "reference": dict(reference_matching_diagnostics or {}),
+            "posterior": dict(getattr(catalogue, "matching_diagnostics", {})),
+        }
+        logger.info("Posterior matching diagnostics: %s", matching_diagnostics["posterior"])
         ridge_probability, valley_probability = probability_maps(
             branches, grid, store.weights, radius=radius
         )
@@ -4205,6 +4388,9 @@ def _run_two_dimensional(settings: Settings) -> Path:
             chain_id=store.chain_id,
             h0_records=h0_records,
             location_configurations=location_configurations,
+            matching_policy=settings.analysis.matching_policy,
+            ridge_region_policy=settings.analysis.ridge_region_policy,
+            matching_diagnostics=matching_diagnostics,
         )
         figure_paths: list[Path] = []
         if settings.plot.write_pdf or settings.plot.write_png:
@@ -4346,6 +4532,8 @@ def _run_two_dimensional(settings: Settings) -> Path:
             "package_version": __version__,
             "fingerprint": fingerprint,
             "topology_sample_signature": topology_sample_signature,
+            **_boundary_policy_metadata(settings),
+            "matching_diagnostics": matching_diagnostics,
             "input_file": str(settings.input.file),
             "number_draws": store.number_draws,
             "grid_shape": list(grid.shape),

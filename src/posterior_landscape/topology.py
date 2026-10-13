@@ -12,6 +12,7 @@ from scipy.interpolate import RegularGridInterpolator
 from scipy.linalg import solve_banded
 from scipy.signal import find_peaks
 
+from .boundary import DomainSupport
 from .io import Grid, normalize_density
 
 try:
@@ -309,6 +310,11 @@ class BranchFeature:
     fallback_width_fraction: float = 0.0
     log_contrast: float = math.nan
     geometry_valid: bool = False
+    region_policy: str = "legacy_two_sided"
+    width_reference: str = "unavailable"
+    strength_reference: str = "unavailable"
+    strength_valid: bool = False
+    boundary_bounded_fraction: float = 0.0
     width_sample_fraction: np.ndarray = field(
         default_factory=lambda: np.empty(0, dtype=np.float32), repr=False
     )
@@ -347,6 +353,27 @@ class BranchFeature:
     )
     section_fallback: np.ndarray = field(
         default_factory=lambda: np.empty(0, dtype=bool), repr=False
+    )
+    section_left_boundary_bounded: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=bool), repr=False
+    )
+    section_right_boundary_bounded: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=bool), repr=False
+    )
+    section_strength_valid: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=bool), repr=False
+    )
+    section_left_boundary_type: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype="U96"), repr=False
+    )
+    section_right_boundary_type: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype="U96"), repr=False
+    )
+    section_left_reference: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype="U32"), repr=False
+    )
+    section_right_reference: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype="U32"), repr=False
     )
     background_density: np.ndarray | None = field(default=None, repr=False)
     feature_region_mask: np.ndarray | None = field(default=None, repr=False)
@@ -396,6 +423,10 @@ class CurveEventFeature:
     fallback_fraction: float = 0.0
     log_contrast: float = math.nan
     relative_contrast: float = math.nan
+    region_policy: str = "legacy_two_sided"
+    strength_valid: bool = False
+    strength_reference: str = "unavailable"
+    boundary_bounded_fraction: float = 0.0
     window_mask: np.ndarray | None = field(default=None, repr=False)
 
 
@@ -1755,7 +1786,290 @@ def _rasterize_valley_background(
     return result
 
 
+def _attach_region_references(branch: BranchFeature, policy: str) -> None:
+    """Populate descriptive references without changing legacy measurements."""
+
+    number = branch.section_valid.size
+    branch.region_policy = policy
+    branch.section_left_boundary_bounded = np.zeros(number, dtype=bool)
+    branch.section_right_boundary_bounded = np.zeros(number, dtype=bool)
+    branch.section_left_boundary_type = np.full(number, "none", dtype="U96")
+    branch.section_right_boundary_type = np.full(number, "none", dtype="U96")
+    branch.section_left_reference = np.full(number, "unavailable", dtype="U32")
+    branch.section_right_reference = np.full(number, "unavailable", dtype="U32")
+    branch.section_left_reference[branch.section_valid] = "legacy_density_crossing"
+    branch.section_right_reference[branch.section_valid] = "legacy_density_crossing"
+    branch.section_strength_valid = (
+        branch.section_valid
+        & np.isfinite(branch.log_contrast_profile)
+        & (branch.log_contrast_profile > 0.0)
+    )
+    branch.strength_valid = bool(np.isfinite(branch.log_contrast) and branch.log_contrast > 0.0)
+    if branch.geometry_valid:
+        branch.width_reference = "two_sided_half_prominence"
+        branch.strength_reference = "two_sided_observed_or_saddle_baseline"
+
+
 def _branch_feature_geometry(
+    branch: BranchFeature,
+    field: np.ndarray,
+    grid: Grid,
+    *,
+    ridge_region_policy: str = "mask_supported",
+    _support: DomainSupport | None = None,
+) -> None:
+    """Measure ridges in supported geometry, retaining legacy interior results.
+
+    A flank can close at its first domain exit instead of a density contour.
+    Such a flank contributes its actual extent, including zero at a nodal
+    ordered boundary.  It does not supply an invented exterior density.
+    Valleys retain their existing two-observed-shoulder definition.
+    """
+
+    if ridge_region_policy not in {"mask_supported", "legacy_two_sided"}:
+        raise ValueError("ridge_region_policy must be mask_supported or legacy_two_sided.")
+    _branch_feature_geometry_legacy(branch, field, grid)
+    _attach_region_references(
+        branch, ridge_region_policy if branch.kind == "ridge" else "legacy_two_sided"
+    )
+    if (
+        ridge_region_policy == "legacy_two_sided"
+        or branch.kind != "ridge"
+        or not branch.curve_available
+        or branch.points_geometry.shape[0] < 3
+    ):
+        return
+
+    number = min(40, branch.points_geometry.shape[0])
+    sample_indices = np.rint(np.linspace(0, branch.points_geometry.shape[0] - 1, number)).astype(int)
+    centers = branch.points_geometry[sample_indices]
+    tangent = np.gradient(branch.points_geometry, axis=0)[sample_indices]
+    norm = np.linalg.norm(tangent, axis=1)
+    usable = norm > np.finfo(float).eps
+    tangent[usable] /= norm[usable, None]
+    normals = np.column_stack([-tangent[:, 1], tangent[:, 0]])
+    normals[~usable] = 0.0
+    support = _support if _support is not None else DomainSupport(grid)
+    dynamic_range = float(np.ptp(field[grid.mask]))
+    numerical_tolerance = max(
+        float(np.max(np.abs(field[grid.mask]))) * 64.0 * np.finfo(float).eps,
+        np.finfo(float).eps,
+    )
+    exits = [
+        [support.ray_exit(center, sign * normal) for center, normal in zip(centers, normals)]
+        for sign in (-1.0, 1.0)
+    ]
+    # Preserve the original calculation bit-for-bit when every section is
+    # already valid and both half crossings lie within supported geometry.
+    if (
+        branch.section_valid.size == number and np.all(branch.section_valid)
+        and dynamic_range > numerical_tolerance
+    ):
+        inside = support.contains(branch.half_left_geometry) & support.contains(branch.half_right_geometry)
+        for side, half in enumerate((branch.half_left_geometry, branch.half_right_geometry)):
+            distance = np.linalg.norm(np.asarray(half, dtype=float) - centers, axis=1)
+            limit = np.asarray([item.distance for item in exits[side]])
+            inside &= distance <= limit + max(support.tolerance, grid.typical_spacing * 1.0e-6)
+        if np.all(inside):
+            return
+
+    fractions = np.linspace(0.0, 1.0, 40) ** 1.5
+    original_profiles = []
+    original_distances = []
+    for sign in (-1.0, 1.0):
+        directions = sign * normals
+        limits = 0.999 * _ray_limit(centers, directions, grid)
+        distances = limits[:, None] * fractions[None, :]
+        samples = centers[:, None, :] + distances[:, :, None] * directions[:, None, :]
+        flattened = samples.reshape(-1, 2)
+        inside = _inside_grid_mask(flattened, grid)
+        values = np.full(flattened.shape[0], np.nan)
+        values[inside] = _sample_field(field, flattened[inside], grid)
+        original_profiles.append(values.reshape(number, 40))
+        original_distances.append(distances)
+
+    tolerance = max(dynamic_range * 1.0e-6, numerical_tolerance)
+    epsilon = max(float(np.max(field[grid.mask])) * 1.0e-12, np.finfo(float).tiny)
+    ridge_base = float(field[branch.saddle_index])
+    half_geometry = [np.full((number, 2), np.nan), np.full((number, 2), np.nan)]
+    shoulder_geometry = [np.full((number, 2), np.nan), np.full((number, 2), np.nan)]
+    widths = [np.full(number, np.nan), np.full(number, np.nan)]
+    levels = np.full((number, 2), np.nan)
+    boundary_bounded = [np.zeros(number, dtype=bool), np.zeros(number, dtype=bool)]
+    boundary_types = [np.full(number, "none", dtype="U96"), np.full(number, "none", dtype="U96")]
+    references = [np.full(number, "unavailable", dtype="U32"), np.full(number, "unavailable", dtype="U32")]
+    contrasts = np.full(number, np.nan)
+    valid = np.zeros(number, dtype=bool)
+    strength_valid = np.zeros(number, dtype=bool)
+    fallback = np.zeros(number, dtype=bool)
+    center_mass = _geometry_to_mass(centers, grid)
+    changed = False
+    for position in range(number):
+        if not usable[position]:
+            continue
+        center = centers[position]
+        center_value = float(_sample_field(field, center[None, :], grid)[0])
+        if not np.isfinite(center_value):
+            continue
+        results = []
+        observed_boundary_levels = []
+        supported = True
+        for side, sign in enumerate((-1.0, 1.0)):
+            exit_info = exits[side][position]
+            if not exit_info.bounded:
+                supported = False
+                boundary_types[side][position] = exit_info.boundary_type
+                if branch.section_valid.size == number and branch.section_valid[position]:
+                    changed = True
+                break
+            direction = sign * normals[position]
+            old_result = _profile_half_crossing(
+                original_profiles[side][position], original_distances[side][position],
+                kind="ridge", tolerance=tolerance, fallback_level=ridge_base,
+            )
+            if (
+                old_result is None
+                and exit_info.distance < original_distances[side][position, -1] - support.tolerance
+            ):
+                changed = True
+            observed_boundary_reference = False
+            if (
+                old_result is not None
+                and old_result[0] <= exit_info.distance + support.tolerance
+                and (old_result[3] or old_result[1] <= exit_info.distance + support.tolerance)
+            ):
+                result = old_result
+            else:
+                if old_result is not None:
+                    changed = True
+                # The old rectangular profile can skip across holes or extend
+                # beyond a mask boundary.  Re-evaluate only that supported part.
+                distances = 0.999 * exit_info.distance * fractions
+                samples = center[None, :] + distances[:, None] * direction[None, :]
+                values = _sample_field(field, samples, grid)
+                result = _profile_half_crossing(
+                    values, distances, kind="ridge", tolerance=tolerance,
+                    fallback_level=ridge_base,
+                )
+                if (
+                    result is None and exit_info.distance > support.tolerance
+                    and np.isfinite(values[-1]) and center_value - float(values[-1]) > tolerance
+                ):
+                    result = _profile_half_crossing(
+                        values, distances, kind="ridge", tolerance=tolerance,
+                        fallback_level=float(values[-1]),
+                    )
+                    observed_boundary_reference = result is not None
+                if result is not None and result[0] > exit_info.distance + support.tolerance:
+                    result = None
+            results.append(result)
+            if result is not None:
+                distance, shoulder_distance, level, used_fallback = result
+                half_geometry[side][position] = center + distance * direction
+                shoulder_geometry[side][position] = center + shoulder_distance * direction
+                levels[position, side] = level
+                fallback[position] |= used_fallback
+                references[side][position] = (
+                    "observed_boundary_level" if observed_boundary_reference
+                    else "saddle_fallback" if used_fallback else "density_half_crossing"
+                )
+                if observed_boundary_reference:
+                    boundary_types[side][position] = exit_info.boundary_type
+            else:
+                # Complete active bins, not inferred exterior density, close a
+                # finite-cell section.  Nodal diagonal exits may have zero extent.
+                half_geometry[side][position] = center + exit_info.distance * direction
+                shoulder_geometry[side][position] = half_geometry[side][position]
+                boundary_bounded[side][position] = True
+                boundary_types[side][position] = exit_info.boundary_type
+                references[side][position] = "support_boundary"
+                if exit_info.distance > support.tolerance:
+                    near_boundary = center + 0.999 * exit_info.distance * direction
+                    boundary_level = float(_sample_field(field, near_boundary[None, :], grid)[0])
+                    if np.isfinite(boundary_level):
+                        observed_boundary_levels.append((exit_info.distance, boundary_level))
+            side_mass = _geometry_to_mass(half_geometry[side][position : position + 1], grid)[0]
+            widths[side][position] = float(np.linalg.norm(side_mass - center_mass[position]))
+        if not supported:
+            continue
+        measured_levels = [float(result[2]) for result in results if result is not None]
+        if measured_levels:
+            # Exactly the legacy geometric mean for two observed flanks, and
+            # the inward level alone when the other side is support-bounded.
+            baseline = (
+                math.sqrt(max(measured_levels[0], epsilon) * max(measured_levels[1], epsilon))
+                if len(measured_levels) == 2 else max(measured_levels[0], epsilon)
+            )
+            if center_value - baseline > tolerance:
+                contrasts[position] = math.log(max(center_value, epsilon) / baseline)
+        elif observed_boundary_levels:
+            # A region may close at both boundaries without a half crossing.
+            # Its observed inward level can describe contrast, but a uniform
+            # supported profile must never acquire artificial strength.
+            _, baseline = max(observed_boundary_levels, key=lambda item: item[0])
+            if center_value - baseline > tolerance:
+                contrasts[position] = math.log(max(center_value, epsilon) / max(baseline, epsilon))
+        strength_valid[position] = np.isfinite(contrasts[position]) and contrasts[position] > 0.0
+        valid[position] = bool(
+            np.isfinite(widths[0][position] + widths[1][position])
+            and widths[0][position] + widths[1][position] > 0.0
+        )
+        if valid[position] and (boundary_bounded[0][position] or boundary_bounded[1][position]):
+            changed = True
+
+    if not changed:
+        return
+    branch.width_sample_fraction = np.linspace(0.0, 1.0, number).astype(np.float32)
+    branch.left_width_profile = widths[0].astype(np.float32)
+    branch.right_width_profile = widths[1].astype(np.float32)
+    branch.width_profile = (widths[0] + widths[1]).astype(np.float32)
+    branch.log_contrast_profile = contrasts.astype(np.float32)
+    branch.width_center_geometry = centers.astype(np.float32)
+    branch.half_left_geometry = half_geometry[0].astype(np.float32)
+    branch.half_right_geometry = half_geometry[1].astype(np.float32)
+    branch.shoulder_left_geometry = shoulder_geometry[0].astype(np.float32)
+    branch.shoulder_right_geometry = shoulder_geometry[1].astype(np.float32)
+    branch.shoulder_levels = levels.astype(np.float32)
+    branch.section_valid = valid
+    branch.section_fallback = fallback
+    branch.section_left_boundary_bounded, branch.section_right_boundary_bounded = boundary_bounded
+    branch.section_left_boundary_type, branch.section_right_boundary_type = boundary_types
+    branch.section_left_reference, branch.section_right_reference = references
+    branch.section_strength_valid = valid & strength_valid
+    branch.valid_width_fraction = float(np.mean(valid))
+    bounded = valid & (boundary_bounded[0] | boundary_bounded[1])
+    branch.boundary_bounded_fraction = float(np.mean(bounded[valid])) if np.any(valid) else 0.0
+    branch.fallback_width_fraction = float(np.mean(fallback[valid])) if np.any(valid) else 0.0
+    branch.width_reference = "mask_supported"
+    branch.geometry_valid = False
+    branch.strength_valid = False
+    branch.strength_reference = "unavailable"
+    branch.log_contrast = math.nan
+    branch.feature_probability = math.nan
+    branch.feature_region_mask = None
+    branch.width_left = branch.width_right = branch.width_median = math.nan
+    branch.width_along_lower = branch.width_along_upper = math.nan
+    if np.count_nonzero(valid) < 2:
+        return
+    combined = widths[0][valid] + widths[1][valid]
+    branch.width_left = float(np.median(widths[0][valid]))
+    branch.width_right = float(np.median(widths[1][valid]))
+    branch.width_median = float(np.median(combined))
+    branch.width_along_lower = float(np.quantile(combined, 0.10))
+    branch.width_along_upper = float(np.quantile(combined, 0.90))
+    if np.any(branch.section_strength_valid):
+        branch.log_contrast = float(np.median(contrasts[branch.section_strength_valid]))
+        branch.strength_valid = True
+        branch.strength_reference = "supported_flanks_or_boundary_level"
+    region = _rasterize_width_sections(half_geometry[0], half_geometry[1], valid, grid)
+    if not np.any(region):
+        return
+    branch.feature_probability = float(np.sum(field[region] * grid.cell_weights[region]))
+    branch.feature_region_mask = region
+    branch.geometry_valid = True
+
+
+def _branch_feature_geometry_legacy(
     branch: BranchFeature,
     field: np.ndarray,
     grid: Grid,
@@ -2073,6 +2387,12 @@ def _curve_events(
             ),
             extent=visible_extent,
             full_extent=full_extent,
+            region_policy=(
+                "mask_supported"
+                if first.kind == "ridge" and (
+                    first.region_policy == "mask_supported" or second.region_policy == "mask_supported"
+                ) else "legacy_two_sided"
+            ),
         )
         if event.full_extent > 0.0:
             event.retained_fraction = float(event.extent / event.full_extent)
@@ -2098,6 +2418,20 @@ def _curve_events(
         event.longest_bounded_fraction = _longest_true_fraction(
             valid_sections, section_weights
         )
+        boundary_sections = []
+        for branch in (first, second):
+            if branch.section_left_boundary_bounded.size == branch.section_valid.size:
+                boundary_sections.append(
+                    branch.section_left_boundary_bounded | branch.section_right_boundary_bounded
+                )
+            else:
+                boundary_sections.append(np.zeros(branch.section_valid.size, dtype=bool))
+        boundary_sections = np.concatenate([boundary_sections[0][::-1], boundary_sections[1][1:]])
+        valid_weight = float(np.sum(section_weights[valid_sections]))
+        event.boundary_bounded_fraction = (
+            float(np.sum(section_weights[valid_sections & boundary_sections]) / valid_weight)
+            if valid_weight > 0.0 else 0.0
+        )
         widths = np.concatenate(
             [first.width_profile[::-1], second.width_profile[1:]]
         )
@@ -2109,6 +2443,17 @@ def _curve_events(
         )
         finite_width = np.isfinite(widths) & (widths > 0.0)
         finite_contrast = np.isfinite(contrasts) & (contrasts > 0.0)
+        if first.width_reference == "mask_supported" or second.width_reference == "mask_supported":
+            finite_width &= valid_sections
+            strength_sections = []
+            for branch in (first, second):
+                strength_sections.append(
+                    branch.section_strength_valid
+                    if branch.section_strength_valid.size == branch.section_valid.size
+                    else np.isfinite(branch.log_contrast_profile) & (branch.log_contrast_profile > 0.0)
+                )
+            strength_sections = np.concatenate([strength_sections[0][::-1], strength_sections[1][1:]])
+            finite_contrast &= valid_sections & strength_sections
         if np.any(finite_width):
             event.width_median = _weighted_median(
                 widths[finite_width], section_weights[finite_width]
@@ -2118,6 +2463,12 @@ def _curve_events(
                 contrasts[finite_contrast], section_weights[finite_contrast]
             )
             event.relative_contrast = float(-np.expm1(-event.log_contrast))
+            event.strength_valid = True
+            event.strength_reference = (
+                "supported_flanks_or_boundary_level"
+                if first.width_reference == "mask_supported" or second.width_reference == "mask_supported"
+                else "two_sided_observed_or_saddle_baseline"
+            )
         if np.any(valid_sections):
             valid_weight = float(np.sum(section_weights[valid_sections]))
             event.fallback_fraction = (
@@ -2763,6 +3114,7 @@ def analyze_field(
     shoulder_alpha_threshold: float = 2.0,
     shoulder_scales: tuple[float, ...] | None = None,
     detect_shoulders: bool = True,
+    ridge_region_policy: str = "mask_supported",
 ) -> FieldAnalysis:
     """Extract a simplified topological catalogue from one density field."""
 
@@ -2772,6 +3124,8 @@ def analyze_field(
         raise ValueError("curve_smoothing_cells must be finite and nonnegative.")
     if not np.isfinite(shoulder_alpha_threshold):
         raise ValueError("shoulder_alpha_threshold must be finite.")
+    if ridge_region_policy not in {"mask_supported", "legacy_two_sided"}:
+        raise ValueError("ridge_region_policy must be mask_supported or legacy_two_sided.")
 
     field = smooth_density(np.asarray(density, dtype=float), grid, scale)
     join_tree = _build_tree(field, grid, descending=True)
@@ -2828,6 +3182,7 @@ def analyze_field(
 
     derivatives = _derivatives(field, grid) if hessian_refinement else None
     branches: list[BranchFeature] = []
+    region_support = DomainSupport(grid) if ridge_region_policy == "mask_supported" else None
     saddle_seen: set[tuple[str, int]] = set()
     for kind, tree, surviving in (
         ("ridge", join_tree, peak_surviving),
@@ -2940,7 +3295,10 @@ def analyze_field(
                         extremum_index, grid, boundary
                     ),
                 )
-                _branch_feature_geometry(branch, field, grid)
+                _branch_feature_geometry(
+                    branch, field, grid, ridge_region_policy=ridge_region_policy,
+                    _support=region_support,
+                )
                 endpoint = point_lookup.get((endpoint_kind, extremum_flat))
                 if endpoint is not None:
                     branch.end_identifier = endpoint.identifier

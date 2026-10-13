@@ -12,7 +12,18 @@ from scipy import ndimage
 from scipy.optimize import linear_sum_assignment
 
 from .io import DensityStore, Grid, input_to_feature_factor
+from .boundary import boundary_contacts
 from .quadrature import cell_joint_tails, cell_percentile
+from .matching import (
+    aligned_event,
+    branch_anchor_keys,
+    branch_compatibility,
+    event_compatibility,
+    match_saddles,
+    point_key,
+    support_component_labels,
+    validate_matching_policy,
+)
 from .topology import (
     BranchFeature,
     CurveEventFeature,
@@ -511,7 +522,7 @@ def _match_quality(
 
 
 def _boundary_role_compatible(first: str, second: str) -> bool:
-    """Prevent an interior hierarchy endpoint from matching a boundary one."""
+    """Historical interior/boundary veto, retained only for legacy matching."""
 
     return (first == "none") == (second == "none")
 
@@ -519,7 +530,7 @@ def _boundary_role_compatible(first: str, second: str) -> bool:
 def _branch_compatibility(
     templates: list[BranchFeature], candidates: list[BranchFeature]
 ) -> np.ndarray:
-    """Compatibility of immutable saddle--extremum branch identities."""
+    """Historical boundary compatibility, used only by the legacy policy."""
 
     return np.asarray(
         [
@@ -540,7 +551,10 @@ def _branch_compatibility(
     )
 
 
-def assign_reference_identifiers(analysis: FieldAnalysis, grid: Grid) -> None:
+def assign_reference_identifiers(
+    analysis: FieldAnalysis, grid: Grid, *, matching_policy: str = "coherent"
+) -> None:
+    validate_matching_policy(matching_policy)
     prefixes = {"peak": "P2D", "pit": "D2D", "saddle": "X2D"}
     for kind, prefix in prefixes.items():
         features = [feature for feature in analysis.points if feature.kind == kind]
@@ -575,6 +589,10 @@ def assign_reference_identifiers(analysis: FieldAnalysis, grid: Grid) -> None:
                 point
                 for point in analysis.points
                 if point.kind == "saddle" and point.index == branch.saddle_index
+                and (
+                    matching_policy == "legacy"
+                    or point.role == ("join" if branch.kind == "ridge" else "split")
+                )
             ),
             None,
         )
@@ -615,7 +633,7 @@ def assign_reference_identifiers(analysis: FieldAnalysis, grid: Grid) -> None:
         feature.identifier = f"S2D{number}"
 
 
-def add_scale_persistence(
+def _add_scale_persistence_legacy(
     reference: FieldAnalysis, other_scales: Iterable[FieldAnalysis], grid: Grid
 ) -> None:
     """Count reference features recovered at the other requested scales."""
@@ -669,6 +687,111 @@ def add_scale_persistence(
             )
             for row, _ in matches:
                 templates[row].scale_count += 1
+
+
+def add_scale_persistence(
+    reference: FieldAnalysis,
+    other_scales: Iterable[FieldAnalysis],
+    grid: Grid,
+    *,
+    matching_policy: str = "coherent",
+) -> dict[str, int]:
+    """Count multiscale recoveries using the same critical-point identities."""
+
+    validate_matching_policy(matching_policy)
+    if matching_policy == "legacy":
+        _add_scale_persistence_legacy(reference, other_scales, grid)
+        return {}
+    other_scales = list(other_scales)
+    total = 1 + len(other_scales)
+    maximum = max(3.0 * grid.typical_spacing, 0.08 * _domain_length(grid))
+    diagnostics: Counter = Counter()
+    components = support_component_labels(grid)
+    for feature in [*reference.points, *reference.branches]:
+        feature.scale_count = 1
+        feature.scale_total = total
+    for analysis in other_scales:
+        point_matches = {}
+        for kind in ("peak", "pit"):
+            templates = [p for p in reference.points if p.kind == kind]
+            candidates = [p for p in analysis.points if p.kind == kind]
+            matches, _ = _assignment(
+                [_point_geometry(p, grid) for p in templates],
+                [_point_geometry(p, grid) for p in candidates],
+                maximum_distance=maximum,
+            )
+            for row, column in matches:
+                templates[row].scale_count += 1
+                point_matches[point_key(templates[row])] = point_key(candidates[column])
+        saddle_matches = match_saddles(
+            reference.points, analysis.points, reference.branches, analysis.branches,
+            point_matches, grid, maximum_distance=maximum, assignment=_assignment,
+            component_labels=components,
+        )
+        point_matches.update(saddle_matches)
+        for point in reference.points:
+            if point.kind == "saddle" and point_key(point) in saddle_matches:
+                point.scale_count += 1
+        for kind in ("ridge", "valley"):
+            templates = [b for b in reference.branches if b.kind == kind]
+            candidates = [b for b in analysis.branches if b.kind == kind]
+            compatibility = branch_compatibility(
+                templates, candidates, point_matches, maximum_distance=maximum,
+                component_labels=components,
+            )
+            matches, _ = _assignment(
+                [_branch_topology_geometry(b) for b in templates],
+                [_branch_topology_geometry(b) for b in candidates],
+                maximum_distance=math.sqrt(2.0) * maximum,
+                compatibility=compatibility,
+            )
+            for row, column in matches:
+                templates[row].scale_count += 1
+            _record_connection_diagnostics(diagnostics, templates, candidates, matches, point_matches, grid)
+    return dict(diagnostics)
+
+
+def _record_connection_diagnostics(
+    diagnostics: Counter,
+    templates: list[BranchFeature],
+    candidates: list[BranchFeature],
+    matches: list[tuple[int, int]],
+    point_matches: dict,
+    grid: Grid,
+    template_anchors: list[tuple] | None = None,
+) -> None:
+    matched_rows = {row for row, _ in matches}
+    for row, column in matches:
+        template, candidate = templates[row], candidates[column]
+        saddle_changed = template.saddle_boundary_type != candidate.saddle_boundary_type
+        extremum_changed = template.extremum_boundary_type != candidate.extremum_boundary_type
+        diagnostics["accepted_branches"] += 1
+        if saddle_changed or extremum_changed:
+            diagnostics["accepted_boundary_transitions"] += 1
+        diagnostics["accepted_saddle_boundary_transitions"] += int(saddle_changed)
+        diagnostics["accepted_extremum_boundary_transitions"] += int(extremum_changed)
+        contacts_changed = set()
+        for endpoint in (0, -1):
+            first = set(boundary_contacts(template.topology_points_geometry[endpoint], grid))
+            second = set(boundary_contacts(candidate.topology_points_geometry[endpoint], grid))
+            contacts_changed.update(first ^ second)
+        if "ordered_diagonal" in contacts_changed:
+            diagnostics["accepted_ordered_diagonal_transitions"] += 1
+        if any(label.startswith(("lower_coordinate", "upper_coordinate")) for label in contacts_changed):
+            diagnostics["accepted_outer_limit_transitions"] += 1
+    for row, template in enumerate(templates):
+        if row in matched_rows:
+            continue
+        saddle, extremum = template_anchors[row] if template_anchors is not None else branch_anchor_keys(template)
+        if extremum not in point_matches:
+            reason = "unmatched_extremum"
+        elif saddle not in point_matches:
+            reason = "unmatched_saddle"
+        elif any(branch_anchor_keys(candidate) == (point_matches[saddle], point_matches[extremum]) for candidate in candidates):
+            reason = "endpoint_distance_or_assignment"
+        else:
+            reason = "connection_absent"
+        diagnostics[f"rejected_branch_{reason}"] += 1
 
 
 def retain_scale_persistent_reference(
@@ -969,6 +1092,12 @@ class BranchTracker:
     fallback_width_fraction: np.ndarray = field(init=False)
     log_contrast: np.ndarray = field(init=False)
     geometry_valid: np.ndarray = field(init=False)
+    boundary_bounded_fraction: np.ndarray = field(init=False)
+    strength_valid: np.ndarray = field(init=False)
+    strength_reference: np.ndarray = field(init=False)
+    width_reference: np.ndarray = field(init=False)
+    boundary_left_profiles: np.ndarray = field(init=False, repr=False)
+    boundary_right_profiles: np.ndarray = field(init=False, repr=False)
     left_width_profiles: np.ndarray = field(init=False, repr=False)
     right_width_profiles: np.ndarray = field(init=False, repr=False)
     width_profiles: np.ndarray = field(init=False, repr=False)
@@ -1004,7 +1133,13 @@ class BranchTracker:
         self.fallback_width_fraction = np.zeros(self.number_draws)
         self.log_contrast = np.full(self.number_draws, np.nan)
         self.geometry_valid = np.zeros(self.number_draws, dtype=bool)
+        self.boundary_bounded_fraction = np.zeros(self.number_draws)
+        self.strength_valid = np.zeros(self.number_draws, dtype=bool)
+        self.strength_reference = np.full(self.number_draws, "unavailable", dtype="U64")
+        self.width_reference = np.full(self.number_draws, "unavailable", dtype="U64")
         profile_shape = (self.number_draws, self.width_points)
+        self.boundary_left_profiles = np.zeros(profile_shape, dtype=bool)
+        self.boundary_right_profiles = np.zeros(profile_shape, dtype=bool)
         self.left_width_profiles = np.full(profile_shape, np.nan, dtype=np.float32)
         self.right_width_profiles = np.full(profile_shape, np.nan, dtype=np.float32)
         self.width_profiles = np.full(profile_shape, np.nan, dtype=np.float32)
@@ -1049,6 +1184,17 @@ class BranchTracker:
         self.fallback_width_fraction[draw] = feature.fallback_width_fraction
         self.log_contrast[draw] = feature.log_contrast
         self.geometry_valid[draw] = feature.geometry_valid
+        self.boundary_bounded_fraction[draw] = getattr(feature, "boundary_bounded_fraction", 0.0)
+        self.strength_valid[draw] = getattr(feature, "strength_valid", False)
+        self.strength_reference[draw] = getattr(feature, "strength_reference", "unavailable")
+        self.width_reference[draw] = getattr(feature, "width_reference", "unavailable")
+        for attribute, destination in (
+            ("section_left_boundary_bounded", self.boundary_left_profiles),
+            ("section_right_boundary_bounded", self.boundary_right_profiles),
+        ):
+            values = np.asarray(getattr(feature, attribute, []), dtype=bool)
+            if values.size == self.width_points:
+                destination[draw] = values
         if feature.width_profile.size == self.width_points:
             self.left_width_profiles[draw] = feature.left_width_profile
             self.right_width_profiles[draw] = feature.right_width_profile
@@ -1072,6 +1218,9 @@ class EventTracker:
     present: np.ndarray = field(init=False)
     curve_available: np.ndarray = field(init=False)
     region_valid: np.ndarray = field(init=False)
+    boundary_bounded_fraction: np.ndarray = field(init=False)
+    strength_valid: np.ndarray = field(init=False)
+    strength_reference: np.ndarray = field(init=False)
     topology_geometry: np.ndarray = field(init=False)
     region_probability: np.ndarray = field(init=False)
     deficit_probability: np.ndarray = field(init=False)
@@ -1102,6 +1251,9 @@ class EventTracker:
         self.present = np.zeros(number, dtype=bool)
         self.curve_available = np.zeros(number, dtype=bool)
         self.region_valid = np.zeros(number, dtype=bool)
+        self.boundary_bounded_fraction = np.zeros(number)
+        self.strength_valid = np.zeros(number, dtype=bool)
+        self.strength_reference = np.full(number, "unavailable", dtype="U64")
         self.topology_geometry = np.full((number, 6), np.nan)
         self.region_probability = np.full(number, np.nan)
         self.deficit_probability = np.full(number, np.nan)
@@ -1141,6 +1293,9 @@ class EventTracker:
         self.present[draw] = True
         self.curve_available[draw] = feature.curve_available
         self.region_valid[draw] = feature.region_valid
+        self.boundary_bounded_fraction[draw] = getattr(feature, "boundary_bounded_fraction", 0.0)
+        self.strength_valid[draw] = getattr(feature, "strength_valid", False)
+        self.strength_reference[draw] = getattr(feature, "strength_reference", "unavailable")
         self.topology_geometry[draw] = _event_topology_geometry(feature)
         self.region_probability[draw] = feature.region_probability
         self.deficit_probability[draw] = feature.deficit_probability
@@ -1326,11 +1481,18 @@ class PosteriorCatalogue:
     shoulder_trackers: list[ShoulderTracker]
     plateau_trackers: list[PlateauTracker]
     topology_signatures: list[tuple[int, int, int, int, int, int]]
+    matching_policy: str = "coherent"
+    saddle_templates: list[PointFeature] = field(default_factory=list)
+    matching_diagnostics: Counter = field(default_factory=Counter)
+    branch_anchor_templates: list[tuple] = field(default_factory=list)
+    component_labels: np.ndarray | None = field(default=None, repr=False)
 
     @classmethod
     def from_reference(
-        cls, reference: FieldAnalysis, number_draws: int, grid: Grid
+        cls, reference: FieldAnalysis, number_draws: int, grid: Grid,
+        *, matching_policy: str = "coherent",
     ) -> PosteriorCatalogue:
+        validate_matching_policy(matching_policy)
         return cls(
             number_draws=number_draws,
             grid=grid,
@@ -1366,6 +1528,10 @@ class PosteriorCatalogue:
                 PlateauTracker(feature, number_draws) for feature in reference.plateaus
             ],
             topology_signatures=[(0, 0, 0, 0, 0, 0)] * number_draws,
+            matching_policy=matching_policy,
+            saddle_templates=[p for p in reference.points if p.kind == "saddle"],
+            branch_anchor_templates=[branch_anchor_keys(branch) for branch in reference.branches],
+            component_labels=support_component_labels(grid) if matching_policy == "coherent" else None,
         )
 
     @property
@@ -1373,6 +1539,225 @@ class PosteriorCatalogue:
         return max(4.0 * self.grid.typical_spacing, 0.10 * _domain_length(self.grid))
 
     def ingest(
+        self,
+        draw: int,
+        analysis: FieldAnalysis,
+        *,
+        draw_weight: float = 1.0,
+        discover: bool = True,
+    ) -> None:
+        if self.matching_policy == "legacy":
+            self._ingest_legacy(draw, analysis, draw_weight=draw_weight, discover=discover)
+            return
+        point_matches = {}
+        if self.component_labels is None:
+            self.component_labels = support_component_labels(self.grid)
+        candidates_by_kind = {
+            kind: [item for item in analysis.points if item.kind == kind]
+            for kind in ("peak", "pit")
+        }
+        for kind in ("peak", "pit"):
+            tracker_indices = [
+                index
+                for index, tracker in enumerate(self.point_trackers)
+                if tracker.template.kind == kind
+            ]
+            trackers = [self.point_trackers[index] for index in tracker_indices]
+            candidates = candidates_by_kind[kind]
+            template_positions = [
+                _point_geometry(item.template, self.grid) for item in trackers
+            ]
+            candidate_positions = [
+                _point_geometry(item, self.grid) for item in candidates
+            ]
+            matches, unmatched = _assignment(
+                template_positions,
+                candidate_positions,
+                maximum_distance=self.maximum_point_distance,
+            )
+            for row, column in matches:
+                point_matches[point_key(trackers[row].template)] = point_key(candidates[column])
+                trackers[row].record(
+                    draw,
+                    candidates[column],
+                    self.grid,
+                    draw_weight,
+                    _match_quality(
+                        template_positions,
+                        candidate_positions,
+                        row,
+                        column,
+                        resolution=self.grid.typical_spacing,
+                    ),
+                )
+            if discover:
+                for column in unmatched:
+                    tracker = PointTracker(
+                        candidates[column], self.number_draws, self.grid.shape, False
+                    )
+                    tracker.record(
+                        draw, candidates[column], self.grid, draw_weight
+                    )
+                    self.point_trackers.append(tracker)
+                    point_matches[point_key(tracker.template)] = point_key(candidates[column])
+
+        saddle_matches = match_saddles(
+            self.saddle_templates, analysis.points,
+            [tracker.template for tracker in self.branch_trackers], analysis.branches,
+            point_matches, self.grid, maximum_distance=self.maximum_point_distance,
+            assignment=_assignment,
+            template_anchors=self.branch_anchor_templates,
+            component_labels=self.component_labels,
+        )
+        point_matches.update(saddle_matches)
+        branch_matches = {}
+        for kind in ("ridge", "valley"):
+            tracker_indices = [i for i, tracker in enumerate(self.branch_trackers) if tracker.template.kind == kind]
+            candidate_indices = [i for i, branch in enumerate(analysis.branches) if branch.kind == kind]
+            trackers = [self.branch_trackers[i] for i in tracker_indices]
+            candidates = [analysis.branches[i] for i in candidate_indices]
+            templates = [tracker.template for tracker in trackers]
+            compatibility = branch_compatibility(
+                templates, candidates, point_matches, maximum_distance=self.maximum_point_distance,
+                template_anchors=[self.branch_anchor_templates[index] for index in tracker_indices],
+                component_labels=self.component_labels,
+            )
+            template_positions = [_branch_topology_geometry(item) for item in templates]
+            candidate_positions = [_branch_topology_geometry(item) for item in candidates]
+            matches, unmatched = _assignment(
+                template_positions, candidate_positions,
+                maximum_distance=math.sqrt(2.0) * self.maximum_point_distance,
+                compatibility=compatibility,
+            )
+            for row, column in matches:
+                branch_matches[tracker_indices[row]] = candidate_indices[column]
+                trackers[row].record(
+                    draw, candidates[column], draw_weight,
+                    _match_quality(
+                        template_positions, candidate_positions, row, column,
+                        resolution=math.sqrt(2.0) * self.grid.typical_spacing,
+                        compatibility=compatibility,
+                    ),
+                )
+            _record_connection_diagnostics(
+                self.matching_diagnostics, templates, candidates, matches, point_matches, self.grid,
+                template_anchors=[self.branch_anchor_templates[index] for index in tracker_indices],
+            )
+            if discover:
+                known = {point_key(saddle) for saddle in self.saddle_templates}
+                mapped_candidates = set(saddle_matches.values())
+                for saddle in analysis.points:
+                    if saddle.kind != "saddle" or point_key(saddle) in mapped_candidates:
+                        continue
+                    key = point_key(saddle)
+                    if key not in known:
+                        self.saddle_templates.append(saddle)
+                        known.add(key)
+                    point_matches.setdefault(key, key)
+                inverse_matches = {candidate: template for template, candidate in point_matches.items()}
+                for column in unmatched:
+                    tracker = BranchTracker(
+                        candidates[column], self.number_draws,
+                        candidates[column].points_geometry.shape[0],
+                        candidates[column].width_profile.size, self.grid.shape, False,
+                    )
+                    tracker.record(draw, candidates[column], draw_weight)
+                    self.branch_trackers.append(tracker)
+                    anchors = branch_anchor_keys(candidates[column])
+                    self.branch_anchor_templates.append(tuple(inverse_matches.get(anchor, anchor) for anchor in anchors))
+
+        trackers = self.shoulder_trackers
+        candidates = analysis.shoulders
+        template_positions = [
+            _shoulder_topology_geometry(item.template) for item in trackers
+        ]
+        candidate_positions = [
+            _shoulder_topology_geometry(item) for item in candidates
+        ]
+        matches, _ = _assignment(
+            template_positions,
+            candidate_positions,
+            maximum_distance=math.sqrt(3.0) * self.maximum_point_distance,
+        )
+        for row, column in matches:
+            trackers[row].record(
+                draw,
+                candidates[column],
+                draw_weight,
+                _match_quality(
+                    template_positions,
+                    candidate_positions,
+                    row,
+                    column,
+                    resolution=math.sqrt(3.0) * self.grid.typical_spacing,
+                ),
+            )
+
+        for kind in ("ridge", "valley"):
+            trackers = [tracker for tracker in self.event_trackers if tracker.template.kind == kind]
+            templates = [tracker.template for tracker in trackers]
+            candidates = [item for item in analysis.events if item.kind == kind]
+            compatibility = event_compatibility(templates, candidates, branch_matches)
+            aligned = {}
+            template_positions = [_event_topology_geometry(item) for item in templates]
+            candidate_positions = [_event_topology_geometry(item) for item in candidates]
+            for row, column in zip(*np.nonzero(compatibility)):
+                aligned[row, column] = aligned_event(templates[row], candidates[column], branch_matches)
+                candidate_positions[column] = _event_topology_geometry(aligned[row, column])
+            matches, _ = _assignment(
+                template_positions, candidate_positions,
+                maximum_distance=math.sqrt(3.0) * self.maximum_point_distance,
+                compatibility=compatibility,
+            )
+            for row, column in matches:
+                trackers[row].record(
+                    draw, aligned[row, column], draw_weight,
+                    _match_quality(
+                        template_positions, candidate_positions, row, column,
+                        resolution=math.sqrt(3.0) * self.grid.typical_spacing,
+                        compatibility=compatibility,
+                    ),
+                )
+                self.matching_diagnostics["accepted_events"] += 1
+            matched_rows = {row for row, _ in matches}
+            for row, template in enumerate(templates):
+                if row in matched_rows:
+                    continue
+                reason = "unmatched_arm" if any(index not in branch_matches for index in template.arm_indices) else "original_pair_absent"
+                self.matching_diagnostics[f"rejected_event_{reason}"] += 1
+
+        for kind in ("plateau", "depression_floor"):
+            trackers = [
+                tracker
+                for tracker in self.plateau_trackers
+                if tracker.template.kind == kind
+            ]
+            candidates = [item for item in analysis.plateaus if item.kind == kind]
+            matches, unmatched = _assignment(
+                [_plateau_geometry(item.template, self.grid) for item in trackers],
+                [_plateau_geometry(item, self.grid) for item in candidates],
+                maximum_distance=self.maximum_point_distance,
+            )
+            for row, column in matches:
+                trackers[row].record(draw, candidates[column], self.grid)
+            if discover:
+                for column in unmatched:
+                    tracker = PlateauTracker(
+                        candidates[column], self.number_draws, False
+                    )
+                    tracker.record(draw, candidates[column], self.grid)
+                    self.plateau_trackers.append(tracker)
+
+        self.topology_signatures[draw] = (
+            sum(item.kind == "peak" for item in analysis.points),
+            sum(item.kind == "pit" for item in analysis.points),
+            sum(item.kind == "ridge" for item in analysis.branches),
+            sum(item.kind == "valley" for item in analysis.branches),
+            len(analysis.shoulders),
+            len(analysis.plateaus),
+        )
+
+    def _ingest_legacy(
         self,
         draw: int,
         analysis: FieldAnalysis,

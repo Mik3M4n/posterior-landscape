@@ -13,12 +13,14 @@ def save_settings(settings: "Settings", destination: str | Path) -> None:
 
     parser = ConfigParser(interpolation=None)
     parser.read(settings.source, encoding="utf-8")
-    for section in ("input", "output"):
+    for section in ("input", "analysis", "output"):
         if not parser.has_section(section):
             parser.add_section(section)
     for name, value in vars(settings.input).items():
         parser.set("input", name, str(value))
     parser.set("input", "file", str(settings.input.file.resolve()))
+    for name in ("matching_policy", "ridge_region_policy"):
+        parser.set("analysis", name, str(getattr(settings.analysis, name)))
     parser.set("output", "directory", str(settings.output.directory.resolve()))
     path = Path(destination)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -100,6 +102,8 @@ class AnalysisSettings:
     shoulder_alpha_threshold: float = 2.0
     detect_shoulders: bool = True
     ordered_tails: bool = True
+    matching_policy: str = "coherent"
+    ridge_region_policy: str = "mask_supported"
 
 
 @dataclass(frozen=True)
@@ -226,6 +230,15 @@ def load_settings(path: str | Path) -> Settings:
     if run_mode not in run_aliases:
         raise ValueError("analysis.run must be '1d', '2d', or 'both'.")
     run_mode = run_aliases[run_mode]
+
+    matching_policy = text("analysis", "matching_policy", "coherent").lower()
+    if matching_policy not in {"coherent", "legacy"}:
+        raise ValueError("analysis.matching_policy must be 'coherent' or 'legacy'.")
+    ridge_region_policy = text("analysis", "ridge_region_policy", "mask_supported").lower()
+    if ridge_region_policy not in {"mask_supported", "legacy_two_sided"}:
+        raise ValueError(
+            "analysis.ridge_region_policy must be 'mask_supported' or 'legacy_two_sided'."
+        )
 
     feature_measure = parser.get(
         "analysis", "feature_measure", fallback="log"
@@ -423,6 +436,8 @@ def load_settings(path: str | Path) -> Settings:
             shoulder_alpha_threshold=shoulder_alpha_threshold,
             detect_shoulders=detect_shoulders,
             ordered_tails=ordered_tails,
+            matching_policy=matching_policy,
+            ridge_region_policy=ridge_region_policy,
         ),
         compute=ComputeSettings(
             workers=workers,

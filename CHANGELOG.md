@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.8.8 — 2026-10-13
+
+- Add `analysis.matching_policy = coherent` as the corrected default. Match
+  arms through corresponding saddle and extremum identities and preserve
+  both original arms of paired events. Distinguish join and split saddles
+  even when they occupy the same grid index, and align event orientation
+  before recording endpoint summaries.
+- Remove boundary membership as an independent matching veto. Peaks and
+  ridges on the ordered diagonal, at array limits, and at their intersections
+  remain eligible subject to coordinate limits and consistent identities.
+- Add `analysis.ridge_region_policy = mask_supported` as the corrected
+  default. Allow one-sided ridge regions bounded by support, record boundary
+  termination, and measure only their supported extent without doubling a
+  width or inventing exterior density or contrast.
+- Preserve full native active bins and diagonal weights for finite-cell
+  regions. Leave nodal quadrature, conservative cell-measure conversion,
+  smoothing, threshold selection, and independent 1D analysis unchanged.
+- Retain explicit `matching_policy = legacy` and
+  `ridge_region_policy = legacy_two_sided` for historical scientific
+  reproduction. The new matching and ridge policies are independent of
+  grid placement and apply to nodal and finite-cell analyses alike.
+- Record matching and region policies with separately versioned schemas;
+  reject incompatible topology checkpoints and completed-output reuse,
+  including downstream association-only reuse.
+- Keep valley shoulder/deficit definitions and the legacy corner-pit
+  exclusion outside this correction. Add focused matching, boundary-region,
+  finite-cell, and resume regression coverage and migration instructions.
+- Require fresh PixelPop and FullPop baseline reruns to establish posterior
+  recovery probabilities and conditional region summaries. Do not carry
+  previous PixelPop numerical persistence thresholds into new variations.
+
 ## 0.8.7 — 2026-10-12
 
 - Add explicit finite-volume input support with `input.grid_location =

@@ -60,6 +60,8 @@ geometry = linear
 feature_measure = linear
 persistence_threshold = auto
 persistence_gap_min_log = 1.0
+matching_policy = coherent
+ridge_region_policy = mask_supported
 detect_shoulders = false
 ordered_tails = false
 
@@ -129,11 +131,13 @@ shoulders require positive coordinates.
 | `nodes` | Existing separable trapezoidal weights | Existing centre-evaluated Jacobian |
 | `cell_centres` | Full finite-volume widths from inferred cell edges | Conservative axis-width ratios |
 
-Omitting `grid_location` or setting it to `nodes` preserves the 0.8.6
-scientific numerical behavior, including the independent notebook-based 1D
-workflow, projections, moments, tails, and associations. New metadata and
-cache signatures may differ. `input.grid_measure` defaults to `linear` and
-has **no numerical effect in nodal mode**.
+Omitting `grid_location` or setting it to `nodes` preserves the existing
+nodal integration and centre-Jacobian conversion. The finite-volume changes
+introduced in 0.8.7 remain strictly opt-in; `input.grid_measure` defaults to
+`linear` and has **no numerical effect in nodal mode**. The separate 0.8.8
+matching and ridge-region corrections apply to both placements. To reproduce
+the previous complete catalogue and measurements, select the two legacy
+analysis policies described below as well as the original grid settings.
 
 For `cell_centres`, `grid_measure` states where the cells were constructed:
 `linear` means physical coordinates; `log` means logarithmic coordinates
@@ -178,6 +182,70 @@ missing-mask behavior of `legacy` is unchanged.
 
 The helper `posterior_landscape.write_hdf5(...)` writes the expected HDF5
 layout. Dataset names and density measure can be supplied explicitly.
+
+## Matching and boundary-supported ridge measurements
+
+The corrected defaults are:
+
+```ini
+[analysis]
+matching_policy = coherent
+ridge_region_policy = mask_supported
+```
+
+`coherent` matching identifies corresponding extrema and saddles before
+matching their connections. An arm must connect the corresponding saddle
+and extremum; a paired event must preserve its two original arms. Join and
+split saddle roles remain distinct. Coordinate-distance limits, one-to-one
+assignment, and ambiguity diagnostics still apply. Boundary membership alone
+does not veto a match, so a peak moving slightly onto the ordered diagonal
+can remain the endpoint of the same ridge across smoothing scales or draws.
+
+Peaks and ridges exactly on the diagonal are legitimate features. A feature
+at a lower or upper array limit is also retained, but its interpretation may
+depend on the model cutoff or the chosen grid range. Such a peak can reflect
+a physical excess or an increasing field truncated by the analysis domain.
+Boundary diagnostics distinguish the ordered diagonal, array limits, and
+their intersections; these labels do not determine whether a feature is
+physical.
+
+`mask_supported` measures ridge sections only within the supported domain.
+A density contour or a support boundary can close a side of the measurement
+region. A ridge on the ordered diagonal can therefore have a valid one-sided
+region when its inward extent is measurable. The exterior is not treated as
+missing density: widths are the actual supported extent, are not doubled,
+and no exterior contrast is invented. Existing valid two-sided interior
+measurements retain their definitions. A region's probability and moments
+use its intersection with the input mask and the configured spatial weights.
+
+For finite cells, support consists of the original active bins. The full
+nominal diagonal-bin weights remain unchanged; profile stopping never clips
+those bins against the continuous ordering line. Nodal regions retain nodal
+quadrature. Profiles stop at the first support exit, including a mask hole,
+rather than crossing unsupported data to another component.
+
+Morphological recovery and valid finite-region measurement remain distinct.
+Boundary-side termination and the measurement reference are reported, so a
+boundary-bounded width is distinguishable from a two-sided density width.
+Changes to matching can alter posterior recovery probabilities, conditional
+location contours, conditional measurements, projections, and associations.
+The reconstructed densities, their population-density HPDs, quadrature,
+automatic-threshold formula, and independent 1D analysis are unchanged.
+
+For an explicit historical comparison use:
+
+```ini
+[analysis]
+matching_policy = legacy
+ridge_region_policy = legacy_two_sided
+```
+
+The policies are independently selectable to separate matching changes from
+region-measurement changes. The legacy pair is required for the complete
+pre-0.8.8 scientific regression; keeping `grid_location = nodes` alone does
+not select legacy matching. Valley deficit measurements still require their
+existing observed shoulder levels, and the legacy corner-pit exclusion is
+unchanged. Neither is redefined by the one-sided ridge correction.
 
 ## Optional analyses
 
@@ -256,9 +324,54 @@ intended.
 The saved settings, log, manifest, and numerical output identify grid
 placement, native measure, quadrature construction, inferred edges and
 axis weights, active/diagonal cell counts, and normalization errors.
-Changing `grid_location` or `grid_measure` invalidates incompatible resume
-and cache products. Historical nodal products are never reused as finite-cell
-results.
+Changing `grid_location`, `grid_measure`, `matching_policy`, or
+`ridge_region_policy` invalidates incompatible resume and cache products.
+Matching and region schemas are versioned separately. Historical nodal
+products are never reused as finite-cell results, and products without the
+corrected policy metadata are never interpreted as corrected catalogues.
+Use fresh output directories for the 0.8.8 baseline reruns; see
+`MIGRATION-0.8.8.md`.
+
+The manifest and HDF5 root record `matching_schema_version` and
+`ridge_region_schema_version` (both `2.0` in this release), alongside the
+resolved policy names. Ridge feature groups expose draw-level
+`boundary_bounded_fraction`, `strength_valid`, `strength_reference`, and,
+for arms, `width_reference`. Reference attributes include
+`reference_boundary_bounded_fraction`, `reference_strength_valid`,
+`reference_strength_reference`, and `reference_width_reference` where
+applicable. Per-section reference diagnostics distinguish left/right support
+boundaries from density crossings. Region validity and contrast validity
+must be inspected separately.
+
+### Read-only reference audit
+
+To compare legacy and corrected reference extraction from existing baseline
+exports, run:
+
+```bash
+python scripts/audit_boundary_reference.py pixelpop_base/full/results.h5 \
+  --expected-peaks 3 --expected-arms 4 --expected-events 2 \
+  --output pixelpop_reference_audit.json
+python scripts/audit_boundary_reference.py fullpop_base/full/results.h5 \
+  --expected-peaks 4 --expected-arms 6 --expected-events 3 \
+  --output fullpop_reference_audit.json
+```
+
+Adjust the paths to the actual export locations. The script reads the
+adjacent `settings.ini` unless `--settings` is supplied. It compares legacy,
+matching-only, and fully corrected policies, checks supported regions and
+probability integrations, and verifies that the source file and quadrature
+are unchanged. Exported float32 projections are checked at their storage
+precision; independent float64 marginal integrations are checked separately.
+Stored input-normalization diagnostics are reported without reintegrating
+the unavailable original draw fields.
+
+The supplied baseline checks restore PixelPop's four ridge arms and two
+paired events, and retain FullPop's four peaks, six arms, and three paired
+events. All six FullPop reference ridge-arm regions and all three paired
+reference regions are now valid; the legacy result had two and one,
+respectively. These are **reference-field checks**, not posterior recovery
+probabilities. This script does not replace rerunning the original draws.
 
 ## PixelPop finite-cell baseline
 
