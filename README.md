@@ -1,423 +1,394 @@
-# posterior-landscape
+<div align="center">
 
-`posterior-landscape` identifies morphological features in a two-dimensional
-probability density. It can analyze one density or an ensemble of posterior
-density draws, match features across draws, propagate their uncertainty, and
-optionally associate feature summaries with any aligned scalar parameter.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/brand/logo_exports/posterior_landscape_wordmark.svg">
+  <img src="assets/brand/logo_exports/posterior_landscape_wordmark_on_light.svg" width="640" alt="posterior-landscape">
+</picture>
 
-The two-dimensional catalogue includes peaks, pits, ridges, valleys, and
-optional slope-change shoulders. Ordered-tail summaries and independent
-one-dimensional marginal analyses are separate opt-in components.
+**Morphological features and uncertainty in posterior density landscapes.**
 
-## Install and run
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)](pyproject.toml)
+[![Version 0.8.8](https://img.shields.io/badge/version-0.8.8-60dfce?style=flat-square&labelColor=111326)](CHANGELOG.md)
+[![License: MIT](https://img.shields.io/badge/license-MIT-f1b06c?style=flat-square&labelColor=111326)](LICENSE)
 
-Python 3.11 or newer is required.
+[Quickstart](#quickstart) · [Inputs](#inputs) · [Outputs](#outputs) · [Output reference](docs/outputs.md) · [Citation](#citation)
+
+</div>
+
+---
+
+`posterior-landscape` turns a two-dimensional density, or an ensemble of posterior
+density draws, into a catalogue of **peaks, pits, ridges, valleys, plateaus, and
+slope-change shoulders**, with the classes selected by the analysis settings.
+It identifies corresponding features across draws and reports their recovery,
+locations, finite measurement regions, and uncertainty.
+
+The interface supports generic coordinates and ordered component-mass
+distributions. Independent marginal analysis, joint-to-marginal comparisons,
+ordered-tail summaries, and associations with an aligned external parameter are
+available as optional analyses.
+
+## What you get
+
+| Question | Package result |
+| --- | --- |
+| Where is the structure? | A reference catalogue of extrema, connecting branches, and optional slope-change fronts. |
+| How consistently is it recovered? | Draw-weighted recovery probabilities, location intervals, and matching diagnostics. |
+| What is its extent? | Automatically measured regions, probabilities, centroids, covariance, widths, and contrast, with validity flags. |
+| How does it appear in a marginal? | Independent 1D catalogues compared with projections of the measured 2D regions. |
+| Is it associated with another parameter? | Conditional rank correlations and mutual-information estimates for aligned posterior samples. |
+| Can I inspect the calculation? | CSV tables, PDF figures, draw-level numerical arrays, saved settings, and a diagnostic manifest. |
+
+The input is an already reconstructed density ensemble. Its declared measure,
+grid placement, domain, and analysis settings determine the meaning of the
+catalogue and its measurements.
+
+## Quickstart
+
+### Install from the repository
+
+Requires **Python 3.11 or newer**. From a checkout of this repository:
 
 ```bash
 python -m pip install -e .
-posterior-landscape validate settings.ini
+posterior-landscape --version
+```
+
+NumPy, SciPy, h5py, Matplotlib, and pandas are installed as dependencies. Optional
+Numba acceleration is available with `python -m pip install -e '.[speed]'`.
+
+### Run the included example
+
+The example generates 64 illustrative density draws on a small rectangular grid,
+then runs the 2D and independent marginal analyses. No external data are needed.
+
+```bash
+python examples/make_demo.py
+posterior-landscape validate examples/demo.ini --all-draws
+posterior-landscape run examples/demo.ini
+```
+
+Open `output/demo/essential/landscape.pdf` and
+`output/demo/essential/features.csv` first. Complete reports are in
+`output/demo/full/`. The perturbed Gaussian mixtures illustrate the interface;
+they are not posterior samples from a scientific inference.
+
+### Run your own ensemble
+
+Copy an example INI, set the input file and output directory, and run:
+
+```bash
+posterior-landscape validate settings.ini --all-draws --json
 posterior-landscape run settings.ini
 ```
 
-The old command remains valid:
+Validation checks the input contract and reports normalization diagnostics
+without feature extraction. `--all-draws` audits every draw; without it, a sample
+is checked. Inspect the raw integrals even when validation succeeds: the analysis
+normalizes each draw, so validation does not require that the original values
+integrated to one.
 
-```bash
-posterior-landscape settings.ini
-```
+The shorter `posterior-landscape settings.ini` command remains supported.
+`python run.py settings.ini` and `python -m posterior_landscape run settings.ini`
+are alternatives. Paths in an analysis INI are relative to that INI file.
 
-For source-tree development, `python run.py settings.ini` is equivalent.
+| Starting point | Use |
+| --- | --- |
+| [examples/demo.ini](examples/demo.ini) | A complete, runnable synthetic example. |
+| [settings.example.ini](settings.example.ini) | Generic positive coordinates on a rectangular nodal grid. |
+| [settings.gw.example.ini](settings.gw.example.ini) | An ordered component-mass analysis on nodes. |
+| [settings.pixelpop.example.ini](settings.pixelpop.example.ini) | An ordered finite-volume field with logarithmic cell centres. |
 
-Start from one of the supplied files:
+## Inputs
 
-- `settings.example.ini`: a generic full-square synthetic analysis;
-- `settings.gw.example.ini`: an explicit rendering of the ordered-mass
-  nodal analysis;
-- `settings.pixelpop.example.ini`: the finite-cell PixelPop baseline, using
-  native logarithmic bins and a fresh output directory.
+The package reads **HDF5** (`.h5`, `.hdf5`) or **NumPy NPZ** (`.npz`). HDF5 is
+recommended for large ensembles. Dataset names are configurable; the coordinate
+names below are examples.
 
-All paths in an INI file are resolved relative to that file.
+| Dataset | Shape | Meaning |
+| --- | --- | --- |
+| `p` | `(B, N1, N2)` | Non-negative densities; array order is draw, coordinate 1, coordinate 2. |
+| `x1`, `x2` | `(N1,)`, `(N2,)` | Finite, strictly increasing coordinates, each with at least two entries. |
+| `mask` | `(N1, N2)` | Boolean support; required for `domain = mask`, optional for `ordered`. |
+| `weights` | `(B,)` | Optional posterior-draw weights for 2D analysis, never spatial integration weights. |
+| External parameter | `(B,)` | Optional finite scalar samples aligned with the density draws. |
+| `chain_id` | `(B,)` | Optional chain labels accompanying the external parameter. |
 
-## Minimal generic configuration
+A single density is represented by `p = field[None, :, :]`; raw 2D input is not
+accepted. Grid axes may have different lengths. Active values must be finite
+and non-negative, with positive integrated mass in every draw. Values outside
+the mask are ignored.
+
+The 2D workflow supports nonuniform non-negative draw weights. For independent
+1D analysis and parameter associations, use equal-weight draws: omit `weights`
+or provide normalized equal weights. Positive coordinates are required for
+logarithmic measures or geometry, the independent 1D finder, and shoulders.
+
+### Specify the scientific conventions
+
+| Setting | Specifies |
+| --- | --- |
+| `input.density_measure` | Density per `dx1 dx2` or per `dlog_base(x1) dlog_base(x2)`. |
+| `analysis.feature_measure` | The density measure used to identify and measure features. |
+| `analysis.geometry` | Linear or logarithmic coordinates for spatial geometry and smoothing. |
+| `input.grid_location` | Coordinates supplied as `nodes` or finite-volume `cell_centres`. |
+| `input.grid_measure` | Linear or logarithmic native coordinates for constructing finite cells; no numerical effect for nodes. |
+| `analysis.log_base` | The logarithm base; use `e` for natural logarithms. |
+
+**Nodes are the default.** They use separable trapezoidal quadrature and the
+existing pointwise Jacobian for density-measure conversion. Explicit
+`cell_centres` mode infers native edges, uses full cell widths, and converts
+measures through width ratios that preserve each cell's probability. Linear
+and logarithmic widths describe the same physical bins.
+
+For a PixelPop-style field supplied at logarithmic cell centres:
 
 ```ini
 [input]
-file = density_draws.h5
-density_dataset = p
-coordinate1_dataset = x1
-coordinate2_dataset = x2
-domain = full
-density_measure = linear
-grid_location = nodes
-grid_measure = linear
-coordinate1_name = x1
-coordinate2_name = x2
-coordinate1_label = $x_1$
-coordinate2_label = $x_2$
+grid_location = cell_centres
+grid_measure = log
+density_measure = log
+domain = ordered
 
 [analysis]
-run = 2d
-geometry = linear
-feature_measure = linear
-persistence_threshold = auto
-persistence_gap_min_log = 1.0
-matching_policy = coherent
-ridge_region_policy = mask_supported
-detect_shoulders = false
-ordered_tails = false
+log_base = e
+```
 
+In `ordered` mode, active centres satisfy `x2 <= x1`, including the diagonal.
+Every active finite-volume cell receives its full nominal weight, without
+automatic half-weighting or clipping against the ordering line.
+
+Use `domain = full` for a complete rectangle, `mask` for supplied support, and
+`ordered` for the inclusive ordered domain with an optional restrictive mask.
+Historical `legacy` mode uses a supplied mask or falls back to strict `x2 < x1`.
+Prefer an explicit domain in new configurations.
+
+See [the input and settings guide](docs/inputs-and-settings.md) for the complete
+contract, measure conversion, optional analyses, and compatibility choices.
+
+## Outputs
+
+### Start with three files
+
+For a completed 2D analysis:
+
+1. **`landscape.pdf`** shows the reference density and detected structure.
+2. **`features.csv`** combines the retained feature families, their recovery,
+   posterior intervals, and class-specific measurements.
+3. **`manifest.json`** records completion, resolved conventions, the selected
+   threshold, feature counts, normalization diagnostics, and available files.
+
+Then open **`results.h5`** for the draw-level measurements and masks needed for
+custom plots or post-processing. Keep the original input: the result archive
+does not reproduce the complete density-draw file.
+
+### Choose a report profile
+
+```ini
+[output]
+directory = output/my_analysis
+profile = full
+full_subdirectory = full
+```
+
+| Profile | Location | Contents |
+| --- | --- | --- |
+| `essential` | Directly in `output.directory` | Main feature and marginal tables, selected comparisons, overview PDFs, metadata, and the numerical archive. |
+| `full` | `output.directory/full/` by default, plus `output.directory/essential/` | All diagnostic reports, with the essential view copied from the same completed analysis. |
+
+**`essential` selects fewer reports; it retains the draw-level arrays in
+`results.h5`.** Additional NPZ exports and diagnostic tables/figures are kept
+only in `full`. Creating the essential view does not repeat the analysis.
+
+Figures are PDF and human-readable tables are CSV. JSON stores metadata; HDF5,
+NPZ, and state files store numerical products. PNG generation is not part of the
+analysis output, even though older INIs may still contain `write_png`.
+
+### What is in each output family?
+
+| Output | Contents and use |
+| --- | --- |
+| `features.csv` | Combined catalogue: reference identities, recovery, posterior location and measurement intervals, and finite-region summaries. Columns are class-dependent. |
+| `catalogue.csv`, `posterior_intervals.csv` | Full-profile source tables separating the point/branch catalogue from its posterior intervals. |
+| `curve_event_catalogue.csv` | Complete ridge or valley events formed from two arms sharing a saddle. Use for the recovery of an entire connection. |
+| `shoulder_catalogue.csv` | Optional slope-change fronts with region and slope measurements. |
+| `feature_location_configurations.csv` | Separately resolved configurations of a feature's conditional centroid distribution, when available. |
+| `results.h5` | Coordinates and quadrature, reference maps, posterior normalization, draw-level features, presence and validity masks, regions, curves, projections, and optional tails/associations. |
+| `*feature_posterior_summary.csv` | Independent marginal families, location intervals, and recovery/classification probabilities. |
+| `*feature_relative_strength_summary.csv` | Full-profile marginal strengths and their measurement availability. |
+| `one_two_dimensional*comparison.csv`, `one_two_dimensional_feature_families.csv` | Relations between independent marginal features and projected 2D measurements, including overlaps and capture fractions. |
+| `external_parameter_associations.csv` | Optional feature-specific correlations and mutual information, with sample and calibration diagnostics. |
+| `two_dimensional_feature_cooccurrence.csv`, `one_dimensional_*_feature_cooccurrence.csv` | Full-profile co-recovery probabilities and dependence summaries. |
+| `global_tail_scales.csv`, `global_tail_probability_curves.csv` | Optional ordered upper-tail scales and probabilities; global summaries rather than localized features. |
+| `settings.ini`, `manifest.json`, `run.log` | Saved configuration, metadata, file inventory, and execution record for the 2D run. |
+
+Only requested analyses produce their corresponding files. A 1D-only run has
+its own marginal manifests and state files; it does not create the 2D
+`results.h5`, `manifest.json`, or `landscape.pdf`. Marginal filenames retain
+historical prefixes such as `fullpop_` even for generic inputs; these do not
+identify the population model used.
+
+### Read the probabilities correctly
+
+| Quantity | Interpretation |
+| --- | --- |
+| **Feature recovery** | The posterior draw-weight fraction in which the corresponding reference feature is recovered. |
+| **Measurement support** | The draw-weight fraction in which that feature is recovered and the requested measurement is valid. |
+| **Region or feature probability** | Population probability integrated over a region within a density draw; distinct from feature recovery. |
+
+Point/arm tables use fields such as `location_support`, `geometry_support`, and
+`measurement_support`; event and shoulder rows also use `P_morph`, `P_loc`, and
+`P_reg`. Their masks and aliases are explained in the
+[output reference](docs/outputs.md#recovery-validity-and-conditioning).
+
+For points, `Pmed(region)` describes the topological component or basin, while
+`Pmed(feature)` describes the finite half-prominence/depth window. A pit or
+valley's integrated **deficit** also differs from the population probability
+inside its window. Inspect the quantity and feature class before comparing
+numbers.
+
+Location intervals are conditional on recovery. Widths, strengths, centroids,
+and other finite measurements use their applicable validity masks. The 2D
+interval mass follows `analysis.credible_mass`; native marginal `q05/q50/q95`
+columns use central 90% intervals. Missing or inapplicable values are not zero.
+
+Catalogue coordinates (`x1`, `x2`) summarize matched point locations or arm
+saddles; posterior curve-endpoint intervals and finite-region centroids
+(`mu1`, `mu2`) describe other location summaries. IDs are
+local to a run: compare physical structure and connectivity across settings,
+rather than relying on IDs alone. A paired ridge and its two arms are related
+descriptions of one connection, not three independent structures.
+
+### Inspect a result in Python
+
+```python
+from pathlib import Path
+import h5py
+import pandas as pd
+
+run_dir = Path("output/demo/full")
+catalogue = pd.read_csv(run_dir / "features.csv")
+print(catalogue.filter(items=[
+    "ID", "type", "x1", "x2",
+    "location_support", "measurement_support", "P_loc", "P_reg",
+]))
+
+with h5py.File(run_dir / "results.h5", "r") as result:
+    print("Feature groups:", list(result["features"]))
+    print("Paired events:", list(result["events"]))
+    print("Grid:", result["coordinates/x1"].shape,
+          result["coordinates/x2"].shape)
+```
+
+For a full file map, HDF5 groups, valid-sample examples, figure contents,
+projection definitions, and legacy field names, see
+**[Understanding the outputs](docs/outputs.md)**.
+
+## Optional analyses
+
+### Independent marginals and projections
+
+```ini
 [one_dimensional]
 enabled = true
+measure = log
+scales = 0.05, 0.075, 0.10
+```
 
+This analyzes both marginals independently and, with a 2D run, compares them
+with projections of measured joint regions. Enable it explicitly with
+`analysis.run = 2d`, or use `analysis.run = both`. For 1D only, set
+`analysis.run = 1d` and `one_dimensional.enabled = true`.
+
+The current finder smooths and matches in logarithmic coordinates even when
+its density measure is linear, so both axes must be positive. It requires
+equal-weight draws. Finite-cell marginalization, conservative resampling, and
+cell-edge cumulative probabilities are activated only by explicit
+`grid_location = cell_centres`.
+
+### Association with an external parameter
+
+```ini
 [association]
 enabled = auto
 dataset = lambda
 chain_id_dataset = chain_id
 parameter_name = lambda
 parameter_label = $\lambda$
-
-[output]
-directory = output/synthetic
-profile = essential
 ```
 
-Here the 2D analysis and the requested independent 1D marginal analyses are
-both run. Set `one_dimensional.enabled = false` for 2D only. Use
-`analysis.run = 1d` together with `one_dimensional.enabled = true` for 1D only.
+Samples must align with the density draws; they may be positive, zero, or
+negative. Without chain IDs they are treated as one chain. Associations require
+equal draw weights; the 1D chain-based calibration also requires equal-length
+chains. An absent parameter dataset produces a warning and leaves density
+analysis available.
 
-For `persistence_threshold = auto`, `persistence_gap_min_log` is the minimum
-natural-log separation between adjacent eligible persistence levels. The
-default `1.0` requires a ratio of at least `e`; the global extrema and the
-terminal gap that would isolate one finite feature do not calibrate the cut.
-If no eligible gap qualifies, the conservative v0.8 fallback is used and
-recorded explicitly. A numeric persistence threshold bypasses this selection.
+Correlations and information describe **posterior association** in each
+measurement's valid sample. Information is in bits; values from different
+features are not additive contributions, independent constraints, or effects of
+removing those features from an inference.
 
-## Input contract
+### Ordered tails and slope changes
 
-HDF5 is recommended for large ensembles; NPZ is useful for small examples.
-Dataset names are configurable. With the names above, the input contains:
+`analysis.ordered_tails = true` enables global upper-tail summaries on a support
+contained in the ordered domain. `analysis.detect_shoulders = true` enables
+common-rescaling logarithmic-slope changes. Both modules are optional. See
+[the settings guide](docs/inputs-and-settings.md#optional-analyses).
 
-| Dataset | Shape | Required | Meaning |
-|---|---:|:---:|---|
-| `p` | `(B, N1, N2)` | yes | one non-negative density grid per draw |
-| `x1` | `(N1,)` | yes | strictly increasing first coordinate |
-| `x2` | `(N2,)` | yes | strictly increasing second coordinate |
-| `mask` | `(N1, N2)` | for `domain=mask` | valid cells |
-| `weights` | `(B,)` | no | draw weights; equal by default |
-| `lambda` | `(B,)` | no | aligned external-parameter samples |
-| `chain_id` | `(B,)` | no | aligned chain labels |
+## Reproducibility and compatibility
 
-The array convention is `p[draw, coordinate1, coordinate2]`. The coordinate
-grids may have different lengths. Every valid cell must be finite and
-non-negative; values outside the mask are ignored.
+Keep the input, INI, and numerical outputs together. Metadata records the
+package and schema versions, threshold selection, quadrature and normalization,
+matching and region policies, and file inventory. Compatible runs can resume;
+use a fresh output directory when changing scientific settings.
+`overwrite = true` deliberately replaces generated products.
 
-`input.density_measure` states the measure of the supplied density:
+Version 0.8.8 defaults to `matching_policy = coherent` and
+`ridge_region_policy = mask_supported`: connections preserve endpoint identities
+and ridge regions can close against the supported domain, including the ordered
+diagonal. Nodal placement alone does not restore pre-0.8.8 matching and region
+behavior; use the explicit legacy policies for that comparison.
 
-- `linear`: density per `dx1 dx2`;
-- `log`: density per `dlog_base(x1) dlog_base(x2)`.
+- [Changelog](CHANGELOG.md)
+- [Compatibility and regression notes](COMPATIBILITY.md)
+- [Finite-cell migration: 0.8.7](MIGRATION-0.8.7.md)
+- [Matching and boundary-region migration: 0.8.8](MIGRATION-0.8.8.md)
+- [Read-only reference audit](scripts/audit_boundary_reference.py)
 
-`analysis.feature_measure` independently chooses the measure in which
-morphology and probability summaries are computed. The package normalizes
-every draw in its declared input measure and converts to the feature measure
-using the grid-placement convention below.
-Log input, log geometry, log feature measures, 1D analysis, and directional
-shoulders require positive coordinates.
+Nonzero Gaussian smoothing scales are approximate on nonuniform grids; inspect
+the spacing warnings. The independent marginal finder has its own resampling
+convention. Automatic thresholds are calibrated separately at each scale;
+numerical thresholds apply a common cutoff. Their multiscale catalogues need
+not be nested.
 
-### Grid placement and finite-volume cells
-
-`input.grid_location` is explicit and defaults to `nodes`:
-
-| Setting | Spatial integration | Density-measure conversion |
-|---|---|---|
-| `nodes` | Existing separable trapezoidal weights | Existing centre-evaluated Jacobian |
-| `cell_centres` | Full finite-volume widths from inferred cell edges | Conservative axis-width ratios |
-
-Omitting `grid_location` or setting it to `nodes` preserves the existing
-nodal integration and centre-Jacobian conversion. The finite-volume changes
-introduced in 0.8.7 remain strictly opt-in; `input.grid_measure` defaults to
-`linear` and has **no numerical effect in nodal mode**. The separate 0.8.8
-matching and ridge-region corrections apply to both placements. To reproduce
-the previous complete catalogue and measurements, select the two legacy
-analysis policies described below as well as the original grid settings.
-
-For `cell_centres`, `grid_measure` states where the cells were constructed:
-`linear` means physical coordinates; `log` means logarithmic coordinates
-using `analysis.log_base`. In that native coordinate, interior edges are
-adjacent-centre midpoints and the two exterior edges extend by half the
-nearest centre spacing. Physical and logarithmic widths are transformations
-of these same edges. The package never infers a second set of bins by
-midpointing transformed centres.
-
-A finite-cell density in measure `a` converts to measure `b` as
-
-\[
-F^{(b)}_{ij}=F^{(a)}_{ij}
-\frac{\Delta\nu^{(a)}_{1,i}\Delta\nu^{(a)}_{2,j}}
-     {\Delta\nu^{(b)}_{1,i}\Delta\nu^{(b)}_{2,j}}.
-\]
-
-Thus each cell's probability mass and the total integral are conserved before
-the numerical-safety normalization. For natural-log native bins, the
-physical widths are `exp(log_edge_high) - exp(log_edge_low)`, and conversion
-to linear density uses `Delta ln(x) / Delta x`, rather than `1/x`.
-
-The Boolean mask denotes cells present in the input. Every active finite
-cell receives its full nominal area, including cells whose centres lie on
-an ordered-domain diagonal. There is no automatic half-weighting or
-geometric clipping. `weights_dataset` continues to identify posterior-draw
-weights, never spatial weights. Supplied fractional-cell areas and explicit
-edge datasets are outside this interface; current edges are inferred.
-
-The supported domains are:
-
-- `full`: the complete rectangular grid;
-- `mask`: exactly the supplied mask;
-- `ordered`: every valid cell must satisfy `coordinate2 <= coordinate1`,
-  allowing only a small floating-point comparison tolerance; an optional
-  supplied mask may further restrict that inclusive triangle;
-- `legacy`: using `mask` when present and otherwise using
-  `m2 < m1`.
-
-Explicit `ordered` mode retains diagonal cells. The historical strict
-missing-mask behavior of `legacy` is unchanged.
-
-The helper `posterior_landscape.write_hdf5(...)` writes the expected HDF5
-layout. Dataset names and density measure can be supplied explicitly.
-
-## Matching and boundary-supported ridge measurements
-
-The corrected defaults are:
-
-```ini
-[analysis]
-matching_policy = coherent
-ridge_region_policy = mask_supported
-```
-
-`coherent` matching identifies corresponding extrema and saddles before
-matching their connections. An arm must connect the corresponding saddle
-and extremum; a paired event must preserve its two original arms. Join and
-split saddle roles remain distinct. Coordinate-distance limits, one-to-one
-assignment, and ambiguity diagnostics still apply. Boundary membership alone
-does not veto a match, so a peak moving slightly onto the ordered diagonal
-can remain the endpoint of the same ridge across smoothing scales or draws.
-
-Peaks and ridges exactly on the diagonal are legitimate features. A feature
-at a lower or upper array limit is also retained, but its interpretation may
-depend on the model cutoff or the chosen grid range. Such a peak can reflect
-a physical excess or an increasing field truncated by the analysis domain.
-Boundary diagnostics distinguish the ordered diagonal, array limits, and
-their intersections; these labels do not determine whether a feature is
-physical.
-
-`mask_supported` measures ridge sections only within the supported domain.
-A density contour or a support boundary can close a side of the measurement
-region. A ridge on the ordered diagonal can therefore have a valid one-sided
-region when its inward extent is measurable. The exterior is not treated as
-missing density: widths are the actual supported extent, are not doubled,
-and no exterior contrast is invented. Existing valid two-sided interior
-measurements retain their definitions. A region's probability and moments
-use its intersection with the input mask and the configured spatial weights.
-
-For finite cells, support consists of the original active bins. The full
-nominal diagonal-bin weights remain unchanged; profile stopping never clips
-those bins against the continuous ordering line. Nodal regions retain nodal
-quadrature. Profiles stop at the first support exit, including a mask hole,
-rather than crossing unsupported data to another component.
-
-Morphological recovery and valid finite-region measurement remain distinct.
-Boundary-side termination and the measurement reference are reported, so a
-boundary-bounded width is distinguishable from a two-sided density width.
-Changes to matching can alter posterior recovery probabilities, conditional
-location contours, conditional measurements, projections, and associations.
-The reconstructed densities, their population-density HPDs, quadrature,
-automatic-threshold formula, and independent 1D analysis are unchanged.
-
-For an explicit historical comparison use:
-
-```ini
-[analysis]
-matching_policy = legacy
-ridge_region_policy = legacy_two_sided
-```
-
-The policies are independently selectable to separate matching changes from
-region-measurement changes. The legacy pair is required for the complete
-pre-0.8.8 scientific regression; keeping `grid_location = nodes` alone does
-not select legacy matching. Valley deficit measurements still require their
-existing observed shoulder levels, and the legacy corner-pit exclusion is
-unchanged. Neither is redefined by the one-sided ridge correction.
-
-## Optional analyses
-
-### One-dimensional marginals
-
-The independent 1D finder is disabled unless it is explicitly requested, or
-an older configuration uses `analysis.run = 1d` or `both`. It analyzes both
-marginals and can compare their features with projections of the 2D feature
-regions. Its current smoothing and matching coordinates are logarithmic, so
-both coordinate grids must be positive. It also retains the requirement
-of equal-weight posterior draws.
-
-Only explicit `cell_centres` mode activates finite-cell marginalization,
-conservative resampling when needed, cell-edge cumulative probabilities,
-and interval probabilities built from the selected measure's cell widths.
-The existing nodal 1D numerical path remains unchanged.
-
-### Ordered tails
-
-Set `analysis.ordered_tails = true` only for a domain entirely contained in
-`coordinate2 <= coordinate1`. The package then computes the configured global
-upper-tail scales and the ordered `P_any`, `P_both`, and `P_straddle`
-decomposition. This option is rejected on a full square or a non-ordered mask.
-
-In finite-cell mode, tail probabilities integrate overlaps of the same full
-nominal bins: `P_any` means either coordinate exceeds the threshold, `P_both`
-means both do, and `P_straddle` means exactly one does. They are computed
-from joint cell probabilities, rather than inferred from ordered marginal
-identities; diagonal bins are not clipped. The reported composition at the
-primary-mass tail scale remains conditional on `coordinate1` exceeding that
-scale, distinguishing both-coordinate exceedance from primary-only
-exceedance. That conditional composition is separate from the overall
-exactly-one-exceedance curve. The nodal tail calculation remains unchanged.
-
-### Directional shoulders
-
-Set `analysis.detect_shoulders = true` to run the existing common-rescaling
-slope-change detector. It uses logarithms of both coordinates and therefore
-requires positive grids. Generic configurations default to shoulders off.
-
-### External parameter
-
-The external scalar is no longer hard-coded to `H0`. Configure its dataset,
-name, label, and optional unit in `[association]`. Samples must be finite and
-aligned draw by draw with `p`; negative and zero values are allowed. When
-`chain_id` is present, calibrations preserve chains. Association analysis
-currently requires equal draw weights. With `enabled = auto`, absence of the
-configured dataset produces a warning and the density analysis continues.
-
-## Outputs
-
-`output.profile = essential` keeps the compact paper-facing result:
-
-- `features.csv`, the consolidated feature catalogue;
-- `landscape.pdf` and requested 1D feature/support PDFs;
-- `external_parameter_associations.csv` when applicable;
-- selected 1D/2D comparison CSV files when applicable;
-- `results.h5` (or the NPZ fallback), `manifest.json`, a settings copy, and
-  the run log.
-
-`output.profile = full` writes the complete diagnostic result under
-`<output.directory>/<output.full_subdirectory>/` and, from that same completed
-run, materializes an `essential/` sibling at `<output.directory>/essential/`.
-The latter is the compact paper-facing view; no topology, posterior, or
-association calculation is repeated. Draw-level numerical archives are kept
-in the `full` directory and are removed only from the compact `essential`
-view. Publication figures are written only as PDF and human-readable tables
-only as CSV. Numerical archives and JSON metadata are retained in their
-appropriate formats. The obsolete `write_png` setting is accepted so old INI
-files still parse, but PNG output is not produced.
-
-Runs are resumable. Use a new output directory when changing scientific
-settings; use `overwrite = true` only when replacing generated products is
-intended.
-
-The saved settings, log, manifest, and numerical output identify grid
-placement, native measure, quadrature construction, inferred edges and
-axis weights, active/diagonal cell counts, and normalization errors.
-Changing `grid_location`, `grid_measure`, `matching_policy`, or
-`ridge_region_policy` invalidates incompatible resume and cache products.
-Matching and region schemas are versioned separately. Historical nodal
-products are never reused as finite-cell results, and products without the
-corrected policy metadata are never interpreted as corrected catalogues.
-Use fresh output directories for the 0.8.8 baseline reruns; see
-`MIGRATION-0.8.8.md`.
-
-The manifest and HDF5 root record `matching_schema_version` and
-`ridge_region_schema_version` (both `2.0` in this release), alongside the
-resolved policy names. Ridge feature groups expose draw-level
-`boundary_bounded_fraction`, `strength_valid`, `strength_reference`, and,
-for arms, `width_reference`. Reference attributes include
-`reference_boundary_bounded_fraction`, `reference_strength_valid`,
-`reference_strength_reference`, and `reference_width_reference` where
-applicable. Per-section reference diagnostics distinguish left/right support
-boundaries from density crossings. Region validity and contrast validity
-must be inspected separately.
-
-### Read-only reference audit
-
-To compare legacy and corrected reference extraction from existing baseline
-exports, run:
+## Development and batch workflows
 
 ```bash
-python scripts/audit_boundary_reference.py pixelpop_base/full/results.h5 \
-  --expected-peaks 3 --expected-arms 4 --expected-events 2 \
-  --output pixelpop_reference_audit.json
-python scripts/audit_boundary_reference.py fullpop_base/full/results.h5 \
-  --expected-peaks 4 --expected-arms 6 --expected-events 3 \
-  --output fullpop_reference_audit.json
-```
-
-Adjust the paths to the actual export locations. The script reads the
-adjacent `settings.ini` unless `--settings` is supplied. It compares legacy,
-matching-only, and fully corrected policies, checks supported regions and
-probability integrations, and verifies that the source file and quadrature
-are unchanged. Exported float32 projections are checked at their storage
-precision; independent float64 marginal integrations are checked separately.
-Stored input-normalization diagnostics are reported without reintegrating
-the unavailable original draw fields.
-
-The supplied baseline checks restore PixelPop's four ridge arms and two
-paired events, and retain FullPop's four peaks, six arms, and three paired
-events. All six FullPop reference ridge-arm regions and all three paired
-reference regions are now valid; the legacy result had two and one,
-respectively. These are **reference-field checks**, not posterior recovery
-probabilities. This script does not replace rerunning the original draws.
-
-## PixelPop finite-cell baseline
-
-For the PixelPop reconstruction with density per
-`dln(m1) dln(m2)`, add these two lines to `[input]`:
-
-```ini
-grid_location = cell_centres
-grid_measure = log
-```
-
-Keep `domain = ordered`, `density_measure = log`, the original inclusive
-mask, and `analysis.log_base = e`. All 5050 active cells in the supplied
-100-by-100 ordered mask, including the 100 diagonal cells, remain active.
-Neither the input HDF5 nor its mask needs modification.
-
-Copy `settings.pixelpop.example.ini` and adjust paths if needed. First audit
-all draws, then run only the baseline:
-
-```bash
-posterior-landscape validate settings.pixelpop.example.ini --all-draws --json
-posterior-landscape run settings.pixelpop.example.ini
-```
-
-The read-only audit streams all 4000 draws and reports the actual raw-integral
-minimum, 5th percentile, median, 95th percentile, maximum, maximum absolute
-normalization error, active and diagonal counts, and marginal-normalization
-errors. It also reports errors after normalization. The expected improvement
-must be checked from these measured values, not assumed from a target value.
-
-Run into a fresh output directory with `persistence_threshold = auto` and
-inspect the newly selected baseline threshold `T0`. Only then construct
-fixed-threshold variants at `0.5 T0` and `2 T0`. The old `T0 = 0.050442` and
-its numerical multiples must not be carried forward automatically. See
-`MIGRATION-0.8.7.md` for the migration steps.
-
-## Previous compatibility
-
-See `COMPATIBILITY.md` for the frozen regression values and production release
-gate.
-
-## Development checks
-
-```bash
+python -m pip install -e '.[test]'
 python -m unittest discover -s tests -v
-python -m compileall -q src tests
 ```
 
-Numba is optional acceleration. Install it with `pip install -e '.[speed]'`.
+A synthetic robustness runner and a batch driver for cached density ensembles
+are included. Start with `python run_posterior_landscape_batch.py --help` and
+[batch workflow notes](docs/inputs-and-settings.md#batch-workflow). The supplied
+[aggregation example](batch_settings.ensemble.aggregate.ini) needs its paths
+edited for your machine.
+
+## Citation
+
+Software metadata is in [CITATION.cff](CITATION.cff). Please cite the accompanying
+methods paper when using the package in research, and report the package version
+and scientific configuration alongside the results.
+
+## Contributing
+
+Bug reports and focused contributions are welcome. For numerical issues,
+include the version, a minimal configuration, relevant manifest/log entries,
+and a small reproducible input when it can be shared. Run the tests before
+submitting changes to scientific calculations.
+
+## License and branding
+
+The code is released under the [MIT license](LICENSE). The supplied logo,
+wordmark, and their reproducible notebook are in
+[assets/brand](assets/brand/README.md).

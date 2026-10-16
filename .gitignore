@@ -15,3 +15,10 @@ output/
 *.h5
 *.hdf5
 *.npz
+
+*.egg-info/
+!tests/data/*.npz
+
+/local-config-backups/
+*.egg-info/
+!tests/data/*.npz

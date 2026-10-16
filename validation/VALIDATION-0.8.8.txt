@@ -1,0 +1,39 @@
+posterior-landscape 0.8.8 boundary matching and supported ridge regions
+Validation: 152 tests passed, 23 subtests passed; h5py installed.
+Python 3.12.14; numpy 2.3.5; scipy 1.17.0; h5py 3.16.0; matplotlib 3.10.8.
+
+Original posterior-density draws were not available in the supplied result ZIPs.
+Real-data checks below re-extract reference catalogues from saved median fields.
+They do not supply new posterior recovery probabilities or draw-level intervals.
+Both original HDF5 exports remained unchanged (SHA256 recorded in JSON reports).
+
+Reference results:
+pixelpop: 3 peaks / 2 arms / 0 paired ridges -> 3 / 4 / 2.
+Corrected supported geometry: 4/4 arms; 2/2 events.
+Active cells/nodes 5050; diagonal 100.
+Reference integral 0.99999999999999978; automatic T0 0.048428526252491236 (unchanged).
+Stored raw-input max normalization error 3.6585498564001284e-07; not reintegrated from original draws.
+Reference peak coordinates, density HPD thresholds, spatial weights and source arrays unchanged.
+
+fullpop: 4 peaks / 6 arms / 3 paired ridges -> 4 / 6 / 3.
+Corrected supported geometry: 6/6 arms; 3/3 events.
+Active cells/nodes 499500; diagonal 999.
+Reference integral 1; automatic T0 0.065303805892489367 (unchanged).
+Stored raw-input max normalization error 1.3622821315451006e-08; not reintegrated from original draws.
+Reference peak coordinates, density HPD thresholds, spatial weights and source arrays unchanged.
+
+Compatibility:
+Existing nodal scientific goldens reproduce 0.8.6 with matching_policy=legacy and ridge_region_policy=legacy_two_sided, including omitted grid_location and explicit nodes/linear or nodes/log.
+Default 0.8.8 matching/regions apply to both placements; nodal spatial quadrature and independent 1D science are unchanged.
+Checkpoint and completed-result guards verify matching/region policy schemas, including programmatic settings changes and missing historical metadata.
+Legacy geometry function is identical to the pre-patch implementation; legacy matching reproduces 268 prior tracker arrays and identifiers in an independent audit.
+
+Rerun:
+Install the source archive, then run the prepared pixelpop_base_v088.ini first.
+Prepared INIs retain the original absolute /mimir input paths, use fresh v088_boundary_support output paths, and select automatic persistence.
+Run fullpop_base_v088.ini afterward. Do not automatically reuse fixed-threshold variation INIs.
+Inspect new catalogues before updating plotting notebooks or paper tables; restored arms can renumber IDs.
+
+The JSON reports include separate matching-only and matching-plus-region comparisons.
+Existing stored projection arrays are float32; their checks use representation precision. Direct float64 marginalization checks use rtol=1e-12.
+Finite-volume diagonal bins retain full nominal weights. No mask/HDF5 editing, half weights, mirrored exterior density, or inward-width doubling was introduced.

@@ -1,0 +1,396 @@
+{
+  "package_version": "0.8.8",
+  "results": "/workspace/scratch/87673316db33/analysis_v087/base/full/results.h5",
+  "source_package_version": "0.8.7",
+  "settings": "/workspace/scratch/87673316db33/analysis_v087/base/full/settings.ini",
+  "source_sha256": "4e6f66743037e4794343070584b30112a5bcc43729e6bb6bbfdc4725411eb561",
+  "scope": "reference fields only; original posterior draws must be rerun separately",
+  "grid_location": "cell_centres",
+  "grid_measure": "log",
+  "active_mask_cells": 5050,
+  "active_diagonal_cells": 100,
+  "stored_input_integrals": {
+    "draws": 4000,
+    "minimum": 0.999999729613939,
+    "q05": 0.9999999057806571,
+    "median": 1.0000000052837719,
+    "q95": 1.0000001121034494,
+    "maximum": 1.0000003658549856,
+    "maximum_absolute_error": 3.6585498564001284e-07,
+    "note": "Stored diagnostics; original draw fields are not reintegrated by this audit"
+  },
+  "reference_integral": 0.9999999999999998,
+  "density_hpd_thresholds": {
+    "0.5": 0.39423879210037893,
+    "0.9": 0.050122404931652674
+  },
+  "modes": {
+    "legacy/legacy_two_sided": {
+      "persistence_threshold": 0.048428526252491236,
+      "peaks": {
+        "P2D1": [
+          1.3383097685729453,
+          1.3383097685729453
+        ],
+        "P2D2": [
+          9.504684682014231,
+          9.014204732145604
+        ],
+        "P2D3": [
+          32.14952994876174,
+          32.14952994876174
+        ]
+      },
+      "ridge_arms": {
+        "R2D2": {
+          "saddle": "X2D2",
+          "peak": "P2D3",
+          "start": [
+            16.145099523820324,
+            11.142139768870122
+          ],
+          "end": [
+            32.14952994876174,
+            32.14952994876174
+          ],
+          "scale_count": 2,
+          "scale_total": 3,
+          "geometry_valid": true,
+          "valid_width_fraction": 0.325,
+          "boundary_bounded_fraction": 0.0,
+          "width_median": 8.537947463417373,
+          "probability": 0.01668051275038912
+        },
+        "R2D1": {
+          "saddle": "X2D1",
+          "peak": "P2D1",
+          "start": [
+            4.526823298353212,
+            4.071673544695636
+          ],
+          "end": [
+            1.3383097685729453,
+            1.3383097685729453
+          ],
+          "scale_count": 2,
+          "scale_total": 3,
+          "geometry_valid": true,
+          "valid_width_fraction": 0.1,
+          "boundary_bounded_fraction": 0.0,
+          "width_median": 0.3041737930113423,
+          "probability": 0.017019362192713407
+        }
+      },
+      "paired_ridges": {},
+      "scale_filter": {
+        "required": 2,
+        "points_removed": 0,
+        "branches_removed": 2
+      },
+      "corner_filter": {
+        "corner_pits_removed": 2,
+        "branches_removed": 2,
+        "events_removed": 1
+      },
+      "matching_diagnostics": {},
+      "maximum_saved_curve_difference": 2.4096280526464398e-12
+    },
+    "coherent/legacy_two_sided": {
+      "persistence_threshold": 0.048428526252491236,
+      "peaks": {
+        "P2D1": [
+          1.3383097685729453,
+          1.3383097685729453
+        ],
+        "P2D2": [
+          9.504684682014231,
+          9.014204732145604
+        ],
+        "P2D3": [
+          32.14952994876174,
+          32.14952994876174
+        ]
+      },
+      "ridge_arms": {
+        "R2D3": {
+          "saddle": "X2D2",
+          "peak": "P2D2",
+          "start": [
+            16.145099523820324,
+            11.142139768870122
+          ],
+          "end": [
+            9.504684682014231,
+            9.014204732145604
+          ],
+          "scale_count": 3,
+          "scale_total": 3,
+          "geometry_valid": true,
+          "valid_width_fraction": 0.525,
+          "boundary_bounded_fraction": 0.0,
+          "width_median": 2.3744753010387676,
+          "probability": 0.13769104969718116
+        },
+        "R2D4": {
+          "saddle": "X2D2",
+          "peak": "P2D3",
+          "start": [
+            16.145099523820324,
+            11.142139768870122
+          ],
+          "end": [
+            32.14952994876174,
+            32.14952994876174
+          ],
+          "scale_count": 3,
+          "scale_total": 3,
+          "geometry_valid": true,
+          "valid_width_fraction": 0.325,
+          "boundary_bounded_fraction": 0.0,
+          "width_median": 8.537947463417373,
+          "probability": 0.01668051275038912
+        },
+        "R2D1": {
+          "saddle": "X2D1",
+          "peak": "P2D2",
+          "start": [
+            4.526823298353212,
+            4.071673544695636
+          ],
+          "end": [
+            9.504684682014231,
+            9.014204732145604
+          ],
+          "scale_count": 3,
+          "scale_total": 3,
+          "geometry_valid": true,
+          "valid_width_fraction": 0.125,
+          "boundary_bounded_fraction": 0.0,
+          "width_median": 0.9489794931680907,
+          "probability": 0.027198085128179394
+        },
+        "R2D2": {
+          "saddle": "X2D1",
+          "peak": "P2D1",
+          "start": [
+            4.526823298353212,
+            4.071673544695636
+          ],
+          "end": [
+            1.3383097685729453,
+            1.3383097685729453
+          ],
+          "scale_count": 3,
+          "scale_total": 3,
+          "geometry_valid": true,
+          "valid_width_fraction": 0.1,
+          "boundary_bounded_fraction": 0.0,
+          "width_median": 0.3041737930113423,
+          "probability": 0.017019362192713407
+        }
+      },
+      "paired_ridges": {
+        "R2DE1": {
+          "arms": [
+            "R2D2",
+            "R2D1"
+          ],
+          "region_valid": true,
+          "probability": 0.044217447320892805,
+          "centroid": [
+            7.235766026412703,
+            5.20554660049187
+          ],
+          "boundary_bounded_fraction": 0.0,
+          "stored_projection_absolute_errors": {
+            "m1": 5.323864127326772e-10,
+            "m2": 1.404733759868826e-10
+          }
+        },
+        "R2DE2": {
+          "arms": [
+            "R2D3",
+            "R2D4"
+          ],
+          "region_valid": true,
+          "probability": 0.15417694857594685,
+          "centroid": [
+            11.421035838114413,
+            8.872448444916854
+          ],
+          "boundary_bounded_fraction": 0.0,
+          "stored_projection_absolute_errors": {
+            "m1": 1.803627192042967e-09,
+            "m2": 1.1526960219665483e-09
+          }
+        }
+      },
+      "scale_filter": {
+        "required": 2,
+        "points_removed": 0,
+        "branches_removed": 0
+      },
+      "corner_filter": {
+        "corner_pits_removed": 2,
+        "branches_removed": 2,
+        "events_removed": 1
+      },
+      "matching_diagnostics": {
+        "accepted_branches": 12,
+        "accepted_boundary_transitions": 6,
+        "accepted_saddle_boundary_transitions": 4,
+        "accepted_extremum_boundary_transitions": 4,
+        "accepted_ordered_diagonal_transitions": 6
+      }
+    },
+    "coherent/mask_supported": {
+      "persistence_threshold": 0.048428526252491236,
+      "peaks": {
+        "P2D1": [
+          1.3383097685729453,
+          1.3383097685729453
+        ],
+        "P2D2": [
+          9.504684682014231,
+          9.014204732145604
+        ],
+        "P2D3": [
+          32.14952994876174,
+          32.14952994876174
+        ]
+      },
+      "ridge_arms": {
+        "R2D3": {
+          "saddle": "X2D2",
+          "peak": "P2D2",
+          "start": [
+            16.145099523820324,
+            11.142139768870122
+          ],
+          "end": [
+            9.504684682014231,
+            9.014204732145604
+          ],
+          "scale_count": 3,
+          "scale_total": 3,
+          "geometry_valid": true,
+          "valid_width_fraction": 1.0,
+          "boundary_bounded_fraction": 0.35,
+          "width_median": 2.8360333121704144,
+          "probability": 0.16224034934151155
+        },
+        "R2D4": {
+          "saddle": "X2D2",
+          "peak": "P2D3",
+          "start": [
+            16.145099523820324,
+            11.142139768870122
+          ],
+          "end": [
+            32.14952994876174,
+            32.14952994876174
+          ],
+          "scale_count": 3,
+          "scale_total": 3,
+          "geometry_valid": true,
+          "valid_width_fraction": 1.0,
+          "boundary_bounded_fraction": 0.475,
+          "width_median": 8.43519070804809,
+          "probability": 0.04837907496831194
+        },
+        "R2D1": {
+          "saddle": "X2D1",
+          "peak": "P2D2",
+          "start": [
+            4.526823298353212,
+            4.071673544695636
+          ],
+          "end": [
+            9.504684682014231,
+            9.014204732145604
+          ],
+          "scale_count": 3,
+          "scale_total": 3,
+          "geometry_valid": true,
+          "valid_width_fraction": 1.0,
+          "boundary_bounded_fraction": 0.5,
+          "width_median": 2.0821296476891207,
+          "probability": 0.17018181172367308
+        },
+        "R2D2": {
+          "saddle": "X2D1",
+          "peak": "P2D1",
+          "start": [
+            4.526823298353212,
+            4.071673544695636
+          ],
+          "end": [
+            1.3383097685729453,
+            1.3383097685729453
+          ],
+          "scale_count": 3,
+          "scale_total": 3,
+          "geometry_valid": true,
+          "valid_width_fraction": 1.0,
+          "boundary_bounded_fraction": 0.25,
+          "width_median": 0.5677558852060173,
+          "probability": 0.38781273911479625
+        }
+      },
+      "paired_ridges": {
+        "R2DE1": {
+          "arms": [
+            "R2D2",
+            "R2D1"
+          ],
+          "region_valid": true,
+          "probability": 0.5572449587320407,
+          "centroid": [
+            4.500248831752549,
+            3.268674126942316
+          ],
+          "boundary_bounded_fraction": 0.4131348825815639,
+          "stored_projection_absolute_errors": {
+            "m1": 1.9707324661055736e-10,
+            "m2": 1.8349337604917082e-09
+          }
+        },
+        "R2DE2": {
+          "arms": [
+            "R2D3",
+            "R2D4"
+          ],
+          "region_valid": true,
+          "probability": 0.20766920867169614,
+          "centroid": [
+            13.995307324077645,
+            11.071476230002508
+          ],
+          "boundary_bounded_fraction": 0.49519635138610973,
+          "stored_projection_absolute_errors": {
+            "m1": 1.7762428194956215e-09,
+            "m2": 1.2819448280687595e-09
+          }
+        }
+      },
+      "scale_filter": {
+        "required": 2,
+        "points_removed": 0,
+        "branches_removed": 0
+      },
+      "corner_filter": {
+        "corner_pits_removed": 2,
+        "branches_removed": 2,
+        "events_removed": 1
+      },
+      "matching_diagnostics": {
+        "accepted_branches": 12,
+        "accepted_boundary_transitions": 6,
+        "accepted_saddle_boundary_transitions": 4,
+        "accepted_extremum_boundary_transitions": 4,
+        "accepted_ordered_diagonal_transitions": 6
+      }
+    }
+  },
+  "source_and_quadrature_unchanged": true
+}
